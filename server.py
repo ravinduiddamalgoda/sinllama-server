@@ -182,6 +182,29 @@ class GenerateResponse(BaseModel):
     inference_time_ms: float
 
 
+class AskRequest(BaseModel):
+    message: str = Field(..., description="User message / question")
+    system_prompt: str = Field(
+        default="ඔබ සිංහල භාෂාවෙන් උත්තර දෙන බුද්ධිමත් සහකාරයෙකි. පැහැදිලිව සහ නිවැරදිව උත්තර දෙන්න.",
+        description="System prompt to guide the model's behaviour",
+    )
+    conversation_history: list[dict] = Field(
+        default=[],
+        description='Previous turns as [{"role":"user"|"assistant","content":"..."}]',
+    )
+    max_new_tokens: int = Field(default=512, ge=1, le=1024)
+    temperature: float = Field(default=0.7, ge=0.1, le=2.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0, le=200)
+    repetition_penalty: float = Field(default=1.1, ge=1.0, le=2.0)
+
+
+class AskResponse(BaseModel):
+    reply: str
+    tokens_generated: int
+    inference_time_ms: float
+
+
 class ChildChatRequest(BaseModel):
     child_utterance: str = Field(..., description="What the child said (Sinhala text)")
     conversation_history: list[str] = Field(default=[], description="Previous turns")
@@ -284,6 +307,56 @@ async def generate_text(req: GenerateRequest):
     except Exception as e:
         logger.error(f"Generation error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/ask",
+    response_model=AskResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def ask(req: AskRequest):
+    """General-purpose LLM endpoint. Send any message with an optional system prompt and conversation history."""
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+    # Build the prompt from system prompt + history + current message
+    parts = [f"{req.system_prompt}\n"]
+
+    for turn in req.conversation_history[-10:]:  # keep last 10 turns
+        role = turn.get("role", "user")
+        content = turn.get("content", "")
+        if role == "user":
+            parts.append(f"පරිශීලකයා: {content}")
+        else:
+            parts.append(f"සහකාරයා: {content}")
+
+    parts.append(f"පරිශීලකයා: {req.message}")
+    parts.append("සහකාරයා:")
+
+    prompt = "\n".join(parts)
+
+    gen_req = GenerateRequest(
+        prompt=prompt,
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        repetition_penalty=req.repetition_penalty,
+    )
+
+    result = await generate_text(gen_req)
+
+    # Clean response — stop at continuation markers
+    response_text = result.generated_text
+    for stop_token in ["පරිශීලකයා:", "\n\n", "සහකාරයා:", "\nපරිශීලකයා", "\nසහකාරයා"]:
+        if stop_token in response_text:
+            response_text = response_text.split(stop_token)[0].strip()
+
+    return AskResponse(
+        reply=response_text,
+        tokens_generated=result.tokens_generated,
+        inference_time_ms=result.inference_time_ms,
+    )
 
 
 @app.post(
