@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     num_gpus = torch.cuda.device_count()
     for i in range(num_gpus):
         name = torch.cuda.get_device_name(i)
-        total = torch.cuda.get_device_properties(i).total_mem / 1e9
+        total = torch.cuda.get_device_properties(i).total_memory / 1e9
         logger.info(f"   GPU {i}: {name} ({total:.1f} GB)")
 
     start = time.time()
@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Input device: {input_device}")
     for i in range(num_gpus):
         alloc = torch.cuda.memory_allocated(i) / 1e9
-        total = torch.cuda.get_device_properties(i).total_mem / 1e9
+        total = torch.cuda.get_device_properties(i).total_memory / 1e9
         logger.info(f"   GPU {i}: {alloc:.2f} / {total:.1f} GB used")
     logger.info(
         f"   API Key: {'Custom' if API_KEY != 'sinllama-default-key-change-me' else '⚠️  DEFAULT (change this!)'}"
@@ -232,7 +232,7 @@ async def health_check():
                 "vram_used_gb": round(torch.cuda.memory_allocated(i) / 1e9, 2),
                 "vram_reserved_gb": round(torch.cuda.memory_reserved(i) / 1e9, 2),
                 "vram_total_gb": round(
-                    torch.cuda.get_device_properties(i).total_mem / 1e9, 1
+                    torch.cuda.get_device_properties(i).total_memory / 1e9, 1
                 ),
             }
         )
