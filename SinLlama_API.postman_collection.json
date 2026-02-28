@@ -1,0 +1,399 @@
+{
+	"info": {
+		"_postman_id": "sinllama-api-collection",
+		"name": "SinLlama API",
+		"description": "Sinhala LLM inference API powered by Meta-Llama-3-8B with SinLlama LoRA adapter.\n\n**Endpoints:**\n- `GET /health` — Health check (no auth)\n- `POST /generate` — Raw text generation\n- `POST /ask` — General-purpose LLM chat\n- `POST /chat` — Child conversation for IoT toy\n\n**Authentication:** All endpoints except `/health` require the `X-API-Key` header.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "https://succeedable-andrea-overdependent.ngrok-free.dev",
+			"type": "string"
+		},
+		{
+			"key": "apiKey",
+			"value": "huruwa*xK9mN2pLq5vW8jY3hZ7bF6cD4eR1sT0uV",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/health",
+					"host": ["{{baseUrl}}"],
+					"path": ["health"]
+				},
+				"description": "Health check endpoint. Returns server status, model loading state, and GPU VRAM usage.\n\n**No authentication required.**"
+			},
+			"response": [
+				{
+					"name": "Healthy",
+					"originalRequest": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/health",
+							"host": ["{{baseUrl}}"],
+							"path": ["health"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"status\": \"healthy\",\n  \"model_loaded\": true,\n  \"gpu_count\": 2,\n  \"input_device\": \"cuda:0\",\n  \"gpus\": [\n    {\n      \"gpu_id\": 0,\n      \"name\": \"NVIDIA RTX 5060 Ti\",\n      \"vram_used_gb\": 5.12,\n      \"vram_reserved_gb\": 5.5,\n      \"vram_total_gb\": 16.0\n    },\n    {\n      \"gpu_id\": 1,\n      \"name\": \"NVIDIA RTX 5060 Ti\",\n      \"vram_used_gb\": 4.88,\n      \"vram_reserved_gb\": 5.2,\n      \"vram_total_gb\": 16.0\n    }\n  ]\n}"
+				}
+			]
+		},
+		{
+			"name": "Generate Text",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					},
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"prompt\": \"ශ්‍රී ලංකාව\",\n  \"max_new_tokens\": 100,\n  \"temperature\": 0.7,\n  \"top_p\": 0.9,\n  \"top_k\": 50,\n  \"repetition_penalty\": 1.1\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/generate",
+					"host": ["{{baseUrl}}"],
+					"path": ["generate"]
+				},
+				"description": "Raw text generation endpoint. Sends a prompt and returns the model's continuation.\n\n**Request Body:**\n| Field | Type | Required | Default | Range |\n|---|---|---|---|---|\n| `prompt` | string | Yes | — | — |\n| `max_new_tokens` | int | No | 256 | 1–1024 |\n| `temperature` | float | No | 0.7 | 0.1–2.0 |\n| `top_p` | float | No | 0.9 | 0.0–1.0 |\n| `top_k` | int | No | 50 | 0–200 |\n| `repetition_penalty` | float | No | 1.1 | 1.0–2.0 |"
+			},
+			"response": [
+				{
+					"name": "Success",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"prompt\": \"ශ්‍රී ලංකාව\",\n  \"max_new_tokens\": 100\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/generate",
+							"host": ["{{baseUrl}}"],
+							"path": ["generate"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"generated_text\": \"ශ්‍රී ලංකාව ඉන්දියානු සාගරයේ පිහිටි දිවයිනකි.\",\n  \"tokens_generated\": 42,\n  \"inference_time_ms\": 1250.3\n}"
+				}
+			]
+		},
+		{
+			"name": "Ask — Simple",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					},
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"message\": \"ශ්‍රී ලංකාවේ අගනුවර කුමක්ද?\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/ask",
+					"host": ["{{baseUrl}}"],
+					"path": ["ask"]
+				},
+				"description": "General-purpose LLM chat endpoint — minimal request with just a message. Uses the default Sinhala system prompt.\n\n**Required:** `message` (string)"
+			},
+			"response": [
+				{
+					"name": "Success",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"message\": \"ශ්‍රී ලංකාවේ අගනුවර කුමක්ද?\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/ask",
+							"host": ["{{baseUrl}}"],
+							"path": ["ask"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"reply\": \"ශ්‍රී ලංකාවේ අගනුවර ශ්‍රී ජයවර්ධනපුර කෝට්ටේ වේ.\",\n  \"tokens_generated\": 35,\n  \"inference_time_ms\": 980.5\n}"
+				}
+			]
+		},
+		{
+			"name": "Ask — With History & Custom System Prompt",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					},
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"message\": \"ඒක ගැන තව කියන්න\",\n  \"system_prompt\": \"ඔබ ශ්‍රී ලංකාව ගැන විශේෂඥයෙකි. සවිස්තරව පිළිතුරු දෙන්න.\",\n  \"conversation_history\": [\n    { \"role\": \"user\", \"content\": \"ශ්‍රී ලංකාවේ අගනුවර කුමක්ද?\" },\n    { \"role\": \"assistant\", \"content\": \"ශ්‍රී ජයවර්ධනපුර කෝට්ටේ වේ.\" }\n  ],\n  \"max_new_tokens\": 80,\n  \"temperature\": 0.7,\n  \"top_p\": 0.9,\n  \"top_k\": 50,\n  \"repetition_penalty\": 1.2\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/ask",
+					"host": ["{{baseUrl}}"],
+					"path": ["ask"]
+				},
+				"description": "General-purpose LLM chat endpoint with full options — custom system prompt, conversation history, and generation parameters.\n\n**Request Body:**\n| Field | Type | Required | Default | Range |\n|---|---|---|---|---|\n| `message` | string | Yes | — | — |\n| `system_prompt` | string | No | Sinhala default | — |\n| `conversation_history` | list[{role,content}] | No | [] | last 10 |\n| `max_new_tokens` | int | No | 512 | 1–1024 |\n| `temperature` | float | No | 0.7 | 0.1–2.0 |\n| `top_p` | float | No | 0.9 | 0.0–1.0 |\n| `top_k` | int | No | 50 | 0–200 |\n| `repetition_penalty` | float | No | 1.1 | 1.0–2.0 |"
+			},
+			"response": [
+				{
+					"name": "Success",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"message\": \"ඒක ගැන තව කියන්න\",\n  \"system_prompt\": \"ඔබ ශ්‍රී ලංකාව ගැන විශේෂඥයෙකි. සවිස්තරව පිළිතුරු දෙන්න.\",\n  \"conversation_history\": [\n    { \"role\": \"user\", \"content\": \"ශ්‍රී ලංකාවේ අගනුවර කුමක්ද?\" },\n    { \"role\": \"assistant\", \"content\": \"ශ්‍රී ජයවර්ධනපුර කෝට්ටේ වේ.\" }\n  ],\n  \"max_new_tokens\": 256\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/ask",
+							"host": ["{{baseUrl}}"],
+							"path": ["ask"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"reply\": \"ශ්‍රී ජයවර්ධනපුර කෝට්ටේ ශ්‍රී ලංකාවේ ව්‍යවස්ථාදායක අගනුවරයි. කොළඹ වාණිජ අගනුවර ලෙස ක්‍රියා කරයි.\",\n  \"tokens_generated\": 58,\n  \"inference_time_ms\": 1520.7\n}"
+				}
+			]
+		},
+		{
+			"name": "Child Chat — Simple",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					},
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"child_utterance\": \"මට කතාවක් කියන්න\",\n  \"child_name\": \"කවිඳු\",\n  \"target_phoneme\": \"ක\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/chat",
+					"host": ["{{baseUrl}}"],
+					"path": ["chat"]
+				},
+				"description": "Child conversation endpoint for the IoT toy. Generates child-friendly Sinhala responses with optional phoneme targeting for speech therapy.\n\n**Request Body:**\n| Field | Type | Required | Default |\n|---|---|---|---|\n| `child_utterance` | string | Yes | — |\n| `child_name` | string | No | \"ළමයා\" |\n| `target_phoneme` | string | No | \"\" |\n| `conversation_history` | list[str] | No | [] (last 6 kept) |"
+			},
+			"response": [
+				{
+					"name": "Success",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"child_utterance\": \"මට කතාවක් කියන්න\",\n  \"child_name\": \"කවිඳු\",\n  \"target_phoneme\": \"ක\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat",
+							"host": ["{{baseUrl}}"],
+							"path": ["chat"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"response\": \"හරි පුතේ! කතාවක් කියන්නම්.\",\n  \"inference_time_ms\": 3200.5\n}"
+				}
+			]
+		},
+		{
+			"name": "Child Chat — With History",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					},
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"child_utterance\": \"ඊට පස්සේ මොකද උනේ?\",\n  \"child_name\": \"කවිඳු\",\n  \"conversation_history\": [\n    \"දරුවා: මට කතාවක් කියන්න\",\n    \"සහකාරයා: හරි පුතේ! එක කොල්ලෙක් හිටියා...\",\n    \"දරුවා: ඊට පස්සේ මොකද උනේ?\"\n  ]\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/chat",
+					"host": ["{{baseUrl}}"],
+					"path": ["chat"]
+				},
+				"description": "Child conversation with conversation history. History entries are plain strings in the format `\"දරුවා: ...\"` or `\"සහකාරයා: ...\"`. Last 6 turns are kept."
+			},
+			"response": [
+				{
+					"name": "Success",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"child_utterance\": \"ඊට පස්සේ මොකද උනේ?\",\n  \"child_name\": \"කවිඳු\",\n  \"conversation_history\": [\n    \"දරුවා: මට කතාවක් කියන්න\",\n    \"සහකාරයා: හරි පුතේ! එක කොල්ලෙක් හිටියා...\"\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat",
+							"host": ["{{baseUrl}}"],
+							"path": ["chat"]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"response\": \"ඒ කොල්ලා එදා ගමට ගියා. ගමේ ලොකු ගහක් තිබුණා.\",\n  \"inference_time_ms\": 950.8\n}"
+				}
+			]
+		}
+	]
+}

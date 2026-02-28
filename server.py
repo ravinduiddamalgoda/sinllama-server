@@ -185,18 +185,18 @@ class GenerateResponse(BaseModel):
 class AskRequest(BaseModel):
     message: str = Field(..., description="User message / question")
     system_prompt: str = Field(
-        default="ඔබ සිංහල භාෂාවෙන් උත්තර දෙන බුද්ධිමත් සහකාරයෙකි. පැහැදිලිව සහ නිවැරදිව උත්තර දෙන්න.",
+        default="ඔබ සිංහල භාෂාවෙන් උත්තර දෙන බුද්ධිමත් සහකාරයෙකි. කෙටිව සහ පැහැදිලිව උත්තර දෙන්න. එක හෝ දෙක වාක්‍ය පමණක් භාවිතා කරන්න.",
         description="System prompt to guide the model's behaviour",
     )
     conversation_history: list[dict] = Field(
         default=[],
         description='Previous turns as [{"role":"user"|"assistant","content":"..."}]',
     )
-    max_new_tokens: int = Field(default=512, ge=1, le=1024)
+    max_new_tokens: int = Field(default=80, ge=1, le=1024)
     temperature: float = Field(default=0.7, ge=0.1, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     top_k: int = Field(default=50, ge=0, le=200)
-    repetition_penalty: float = Field(default=1.1, ge=1.0, le=2.0)
+    repetition_penalty: float = Field(default=1.2, ge=1.0, le=2.0)
 
 
 class AskResponse(BaseModel):
@@ -215,6 +215,29 @@ class ChildChatRequest(BaseModel):
 class ChildChatResponse(BaseModel):
     response: str
     inference_time_ms: float
+
+
+# === Helpers ===
+
+import re
+
+
+def _truncate_to_sentences(text: str, max_sentences: int = 1) -> str:
+    """Truncate text to at most `max_sentences` complete Sinhala sentences.
+    Splits on common Sinhala/Unicode sentence-ending punctuation."""
+    if not text:
+        return text
+    # Split on sentence-ending punctuation (. ! ? and Sinhala full stop ।)
+    parts = re.split(r'(?<=[.!?।])\s*', text.strip())
+    # Take only the requested number of sentences
+    selected = [p for p in parts[:max_sentences] if p.strip()]
+    if selected:
+        return " ".join(selected).strip()
+    # If no sentence boundary found, cap at ~60 chars on a word boundary
+    if len(text) > 60:
+        truncated = text[:60].rsplit(" ", 1)[0]
+        return truncated.strip() + "."
+    return text.strip()
 
 
 # === API Endpoints ===
@@ -352,6 +375,9 @@ async def ask(req: AskRequest):
         if stop_token in response_text:
             response_text = response_text.split(stop_token)[0].strip()
 
+    # Truncate to first 2 sentences max for conversational brevity
+    response_text = _truncate_to_sentences(response_text, max_sentences=2)
+
     return AskResponse(
         reply=response_text,
         tokens_generated=result.tokens_generated,
@@ -382,6 +408,7 @@ async def child_chat(req: ChildChatRequest):
     prompt = f"""ඔබ කුඩා දරුවන් සමග සිංහලෙන් කතා කරන මිත්‍රශීලී සහකාරයෙකි.
 දරුවාගේ නම: {req.child_name}
 {phoneme_line}
+වැදගත්: එක කෙටි වාක්‍යයක් පමණක් පිළිතුරු දෙන්න. දිගු පැහැදිලි කිරීම් අවශ්‍ය නැත.
 සරල, කෙටි වාක්‍ය භාවිතා කරන්න. දරුවාට තේරෙන භාෂාවෙන් කතා කරන්න.
 
 පෙර සංවාදය:
@@ -390,14 +417,14 @@ async def child_chat(req: ChildChatRequest):
 දරුවා: {req.child_utterance}
 සහකාරයා:"""
 
-    # Generate
+    # Generate — keep max_new_tokens low for fast conversational responses
     gen_req = GenerateRequest(
         prompt=prompt,
-        max_new_tokens=150,
-        temperature=0.7,
-        top_p=0.9,
-        top_k=50,
-        repetition_penalty=1.2,
+        max_new_tokens=50,
+        temperature=0.6,
+        top_p=0.85,
+        top_k=40,
+        repetition_penalty=1.3,
     )
 
     result = await generate_text(gen_req)
@@ -407,6 +434,9 @@ async def child_chat(req: ChildChatRequest):
     for stop_token in ["දරුවා:", "\n\n", "සහකාරයා:", "\nදරුවා", "\nසහකාරයා"]:
         if stop_token in response_text:
             response_text = response_text.split(stop_token)[0].strip()
+
+    # Truncate to first sentence for quick chat-style reply
+    response_text = _truncate_to_sentences(response_text, max_sentences=1)
 
     return ChildChatResponse(
         response=response_text,
