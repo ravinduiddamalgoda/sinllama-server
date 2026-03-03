@@ -234,7 +234,7 @@ class ChildChatRequest(BaseModel):
     current_word: str = Field(default="", description="The Sinhala word currently being practiced (e.g. 'බල්ලා')")
     pronunciation_result: str = Field(
         default="",
-        description="ASR pronunciation result: 'correct', 'close', 'retry', 'no_speech', or 'skipped'",
+        description="ASR pronunciation result: 'correct', 'close', 'retry', 'no_speech', 'skipped', or 'new_word' (introducing a new word)",
     )
     attempt_number: int = Field(default=1, ge=1, le=10, description="Which attempt this is for the current word")
     session_words: list[str] = Field(default=[], description="All words in this session (e.g. ['බල්ලා','පූසා','අලියා'])")
@@ -423,45 +423,60 @@ async def child_chat(req: ChildChatRequest):
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
-    # Build conversation history (keep last 4 turns for speed)
+    # Build conversation history (keep last 6 turns for richer context)
     history_text = ""
     if req.conversation_history:
-        history_text = "\n".join(req.conversation_history[-4:])
+        history_text = "\n".join(req.conversation_history[-6:])
 
     # Build context lines
     context_lines = []
     if req.current_word:
-        context_lines.append(f"දැන් පුහුණු කරන වචනය: '{req.current_word}'")
+        context_lines.append(f"දැන් ඉගෙන ගන්න වචනය: '{req.current_word}'")
     if req.target_phoneme:
         context_lines.append(f"ඉලක්ක ශබ්දය: {req.target_phoneme}")
-    if req.pronunciation_result:
-        result_map = {
-            "correct": "දරුවා වචනය නිවැරදිව කිව්වා! ප්‍රශංසා කරන්න.",
-            "close": "දරුවා ආසන්නව කිව්වා. දිරිමත් කරන්න, නැවත උත්සාහ කරන්න කියන්න.",
-            "retry": "දරුවාට වචනය හරියට කියන්න බැරි උනා. බය නොවී ආයෙත් කියන්න කියන්න.",
-            "no_speech": "දරුවා කතා කළේ නැහැ. දිරිමත් කරන්න, බය වෙන්න එපා කියන්න.",
-            "skipped": "වචනය මඟ හැරියා. කමක් නැත කියන්න, ඊළඟ වචනයට යන්න.",
-        }
-        result_hint = result_map.get(req.pronunciation_result, "")
-        if result_hint:
-            context_lines.append(result_hint)
-    if req.attempt_number > 1:
-        context_lines.append(f"මෙය {req.attempt_number} වන උත්සාහයයි.")
     if req.session_words:
-        context_lines.append(f"අද session වචන: {', '.join(req.session_words)}")
+        context_lines.append(f"අද session එකේ වචන 3: {', '.join(req.session_words)}")
+
+    # Build situation description based on pronunciation result
+    situation = ""
+    if req.pronunciation_result == "correct":
+        situation = f"දරුවා '{req.current_word}' නිවැරදිව කිව්වා! සතුටින් ප්‍රශංසා කරන්න, වචනය ගැන කුඩා රසවත් කතාවක් කියන්න."
+    elif req.pronunciation_result == "close":
+        situation = f"දරුවා '{req.current_word}' ආසන්නව කිව්වා, නමුත් තව ටිකක් හොඳ කරන්න ඕනේ. දිරිමත් කරලා නැවත කියන්න කියන්න."
+    elif req.pronunciation_result == "retry":
+        if req.attempt_number >= 3:
+            situation = f"දරුවා '{req.current_word}' කියන්න {req.attempt_number} පාරක් උත්සාහ කරලා. බය නොවෙන්න කියන්න. වචනය ගැන රසවත් දෙයක් කියලා ආයෙත් කියන්න කියන්න."
+        else:
+            situation = f"දරුවා '{req.current_word}' හරියට කියන්න බැරි උනා. බය නොවෙන්න කියලා, වචනය ගැන සරල විස්තරයක් කියලා ආයෙත් කියන්න කියන්න."
+    elif req.pronunciation_result == "no_speech":
+        if req.attempt_number >= 3:
+            situation = f"දරුවා කතා කළේ නැහැ ({req.attempt_number} වන පාර). ඉතා මිත්‍රශීලීව '{req.current_word}' ගැන කුඩා කතාවක් කියලා දිරිමත් කරන්න."
+        else:
+            situation = f"දරුවා කතා කළේ නැහැ. '{req.current_word}' ගැන රසවත් දෙයක් කියලා කියන්න බය වෙන්න එපා කියන්න."
+    elif req.pronunciation_result == "skipped":
+        situation = f"'{req.current_word}' මඟ හැරියා. කමක් නැත කියන්න, ඊළඟ වචනයට යමු කියන්න."
+    elif req.pronunciation_result == "new_word":
+        situation = f"අලුත් වචනයක් හඳුන්වා දෙන්න: '{req.current_word}'. මේ වචනය ගැන කුඩා රසවත් විස්තරයක් කියලා, දරුවාට කියන්න කියන්න."
+
+    if situation:
+        context_lines.append(situation)
+    if req.attempt_number > 1 and req.pronunciation_result not in ("correct", "skipped", "new_word"):
+        context_lines.append(f"මෙය {req.attempt_number} වන උත්සාහයයි.")
 
     context_text = "\n".join(context_lines)
 
-    prompt = f"""ඔබ වයස 3ත් 10ත් අතර කුඩා දරුවන්ට සිංහල වචන උච්චාරණය කිරීමට උගන්වන මිත්‍රශීලී ගැහැණු ගුරුවරියකි.
-ඔබේ නම 'අක්කා' කියලා දරුවන් කතා කරනවා. ඔබ ඉතා කරුණාවන්ත, ඉවසිලිවන්ත, දිරිමත් කරන ගුරුවරියකි.
+    prompt = f"""ඔබ වයස 3ත් 10ත් අතර කුඩා දරුවන්ට සිංහල වචන කතා කිරීමට උගන්වන මිත්‍රශීලී ගැහැණු ගුරුවරියකි.
+ඔබේ නම 'අක්කා'. ඔබ ඉතා කරුණාවන්ත, ඉවසිලිවන්ත, රසවත් කතා කියන ගුරුවරියකි.
 දරුවාගේ නම: {req.child_name}
 {context_text}
-වැදගත් නීති:
-- එක කෙටි වාක්‍යයක් පමණක් කියන්න.
-- සරල, දරුවාට තේරෙන සිංහල වචන පමණක් භාවිතා කරන්න.
+
+ඔබේ කාර්යය:
+- දරුවාත් එක්ක සංවාදයක් වගේ කතා කරන්න, වචන drill එකක් වගේ නොවේ.
+- වචනය ගැන කුඩා රසවත් කතාවක් හෝ විස්තරයක් කියන්න (උදා: 'බල්ලා' නම් - "බල්ලා වව් වව් කියනවා නේ? බල්ලා ගෙදර රකිනවා!" වගේ).
+- ඊට පස්සේ ස්වාභාවිකව දරුවාට වචනය කියන්න කියන්න.
+- කෙටි වාක්‍ය 2-3ක් පමණක් කියන්න. ඉතා දිගු නොවිය යුතුයි.
+- සරල, දරුවාට තේරෙන සිංහල භාවිතා කරන්න.
 - 'හොඳයි!', 'වාව්!', 'ඔයාට පුළුවන්!', 'බය වෙන්න එපා!' වැනි දිරිගැන්වීම් භාවිතා කරන්න.
-- දරුවා නිවැරදිව කිව්වොත් ප්‍රශංසා කරන්න.
-- දරුවාට අමාරු නම් උච්චාරණ උපදෙස් දෙන්න.
 
 පෙර සංවාදය:
 {history_text}
@@ -469,13 +484,13 @@ async def child_chat(req: ChildChatRequest):
 දරුවා: {req.child_utterance}
 ගුරුවරිය:"""
 
-    # Generate — keep max_new_tokens low for fast conversational responses
+    # Generate — slightly more tokens for conversational richness
     gen_req = GenerateRequest(
         prompt=prompt,
-        max_new_tokens=35,
-        temperature=0.3,
-        top_p=0.85,
-        top_k=40,
+        max_new_tokens=60,
+        temperature=0.5,
+        top_p=0.9,
+        top_k=50,
         repetition_penalty=1.3,
     )
 
@@ -487,8 +502,8 @@ async def child_chat(req: ChildChatRequest):
         if stop_token in response_text:
             response_text = response_text.split(stop_token)[0].strip()
 
-    # Truncate to first sentence for quick chat-style reply
-    response_text = _truncate_to_sentences(response_text, max_sentences=1)
+    # Allow 2-3 sentences for conversational feel
+    response_text = _truncate_to_sentences(response_text, max_sentences=3)
 
     return ChildChatResponse(
         response=response_text,
