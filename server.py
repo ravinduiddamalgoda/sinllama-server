@@ -227,10 +227,17 @@ class AskResponse(BaseModel):
 
 
 class ChildChatRequest(BaseModel):
-    child_utterance: str = Field(..., description="What the child said (Sinhala text)")
+    child_utterance: str = Field(..., description="What the child said (ASR transcription from Raspberry Pi)")
     conversation_history: list[str] = Field(default=[], description="Previous turns")
     child_name: str = Field(default="ළමයා", description="Child's name")
     target_phoneme: str = Field(default="", description="Target phoneme for practice")
+    current_word: str = Field(default="", description="The Sinhala word currently being practiced (e.g. 'බල්ලා')")
+    pronunciation_result: str = Field(
+        default="",
+        description="ASR pronunciation result: 'correct', 'close', 'retry', 'no_speech', or 'skipped'",
+    )
+    attempt_number: int = Field(default=1, ge=1, le=10, description="Which attempt this is for the current word")
+    session_words: list[str] = Field(default=[], description="All words in this session (e.g. ['බල්ලා','පූසා','අලියා'])")
 
 
 class ChildChatResponse(BaseModel):
@@ -421,28 +428,52 @@ async def child_chat(req: ChildChatRequest):
     if req.conversation_history:
         history_text = "\n".join(req.conversation_history[-4:])
 
-    # Build prompt
-    phoneme_line = (
-        f"ඉලක්ක ශබ්දය: {req.target_phoneme}" if req.target_phoneme else ""
-    )
+    # Build context lines
+    context_lines = []
+    if req.current_word:
+        context_lines.append(f"දැන් පුහුණු කරන වචනය: '{req.current_word}'")
+    if req.target_phoneme:
+        context_lines.append(f"ඉලක්ක ශබ්දය: {req.target_phoneme}")
+    if req.pronunciation_result:
+        result_map = {
+            "correct": "දරුවා වචනය නිවැරදිව කිව්වා! ප්‍රශංසා කරන්න.",
+            "close": "දරුවා ආසන්නව කිව්වා. දිරිමත් කරන්න, නැවත උත්සාහ කරන්න කියන්න.",
+            "retry": "දරුවාට වචනය හරියට කියන්න බැරි උනා. බය නොවී ආයෙත් කියන්න කියන්න.",
+            "no_speech": "දරුවා කතා කළේ නැහැ. දිරිමත් කරන්න, බය වෙන්න එපා කියන්න.",
+            "skipped": "වචනය මඟ හැරියා. කමක් නැත කියන්න, ඊළඟ වචනයට යන්න.",
+        }
+        result_hint = result_map.get(req.pronunciation_result, "")
+        if result_hint:
+            context_lines.append(result_hint)
+    if req.attempt_number > 1:
+        context_lines.append(f"මෙය {req.attempt_number} වන උත්සාහයයි.")
+    if req.session_words:
+        context_lines.append(f"අද session වචන: {', '.join(req.session_words)}")
 
-    prompt = f"""ඔබ කුඩා දරුවන් සමග සිංහලෙන් කතා කරන මිත්‍රශීලී සහකාරයෙකි.
+    context_text = "\n".join(context_lines)
+
+    prompt = f"""ඔබ වයස 3ත් 10ත් අතර කුඩා දරුවන්ට සිංහල වචන උච්චාරණය කිරීමට උගන්වන මිත්‍රශීලී ගැහැණු ගුරුවරියකි.
+ඔබේ නම 'අක්කා' කියලා දරුවන් කතා කරනවා. ඔබ ඉතා කරුණාවන්ත, ඉවසිලිවන්ත, දිරිමත් කරන ගුරුවරියකි.
 දරුවාගේ නම: {req.child_name}
-{phoneme_line}
-වැදගත්: එක කෙටි වාක්‍යයක් පමණක් පිළිතුරු දෙන්න. දිගු පැහැදිලි කිරීම් අවශ්‍ය නැත.
-සරල, කෙටි වාක්‍ය භාවිතා කරන්න. දරුවාට තේරෙන භාෂාවෙන් කතා කරන්න.
+{context_text}
+වැදගත් නීති:
+- එක කෙටි වාක්‍යයක් පමණක් කියන්න.
+- සරල, දරුවාට තේරෙන සිංහල වචන පමණක් භාවිතා කරන්න.
+- 'හොඳයි!', 'වාව්!', 'ඔයාට පුළුවන්!', 'බය වෙන්න එපා!' වැනි දිරිගැන්වීම් භාවිතා කරන්න.
+- දරුවා නිවැරදිව කිව්වොත් ප්‍රශංසා කරන්න.
+- දරුවාට අමාරු නම් උච්චාරණ උපදෙස් දෙන්න.
 
 පෙර සංවාදය:
 {history_text}
 
 දරුවා: {req.child_utterance}
-සහකාරයා:"""
+ගුරුවරිය:"""
 
     # Generate — keep max_new_tokens low for fast conversational responses
     gen_req = GenerateRequest(
         prompt=prompt,
         max_new_tokens=35,
-        temperature=0.6,
+        temperature=0.3,
         top_p=0.85,
         top_k=40,
         repetition_penalty=1.3,
@@ -452,7 +483,7 @@ async def child_chat(req: ChildChatRequest):
 
     # Clean response — stop at continuation markers
     response_text = result.generated_text
-    for stop_token in ["දරුවා:", "\n\n", "සහකාරයා:", "\nදරුවා", "\nසහකාරයා"]:
+    for stop_token in ["දරුවා:", "\n\n", "ගුරුවරිය:", "\nදරුවා", "\nගුරුවරිය"]:
         if stop_token in response_text:
             response_text = response_text.split(stop_token)[0].strip()
 
