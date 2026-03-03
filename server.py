@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI):
     # Set memory config for better allocation across 2 GPUs
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
+    # Enable CUDA optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     from peft import PeftModel
 
@@ -88,6 +93,7 @@ async def lifespan(app: FastAPI):
         device_map="auto",
         max_memory={0: "14GiB", 1: "14GiB", "cpu": "64GiB"},
         low_cpu_mem_usage=True,
+        attn_implementation="eager",  # use "flash_attention_2" if flash-attn is installed
     )
 
     # Log device map summary
@@ -110,29 +116,44 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"   Tokenizer loaded. Vocab size: {len(tokenizer)}")
 
-    # --- Step 3: Apply SinLlama LoRA Adapter ---
-    logger.info("🔗 Applying SinLlama LoRA adapter (loading on CPU first)...")
-    model = PeftModel.from_pretrained(
+    # --- Step 3: Apply SinLlama LoRA Adapter & Merge ---
+    logger.info("🔗 Applying SinLlama LoRA adapter...")
+    peft_model = PeftModel.from_pretrained(
         base_model,
         ADAPTER_PATH,
-        device_map="cpu",  # load weights on CPU first to avoid VRAM spike
     )
+
+    # Merge LoRA weights into base model — eliminates CPU↔GPU transfer overhead
+    logger.info("🔀 Merging LoRA weights into base model for faster inference...")
+    model = peft_model.merge_and_unload()
     model.eval()
+
+    for i in range(num_gpus):
+        alloc = torch.cuda.memory_allocated(i) / 1e9
+        logger.info(f"   GPU {i} VRAM after merge: {alloc:.2f} GB")
 
     # --- Step 4: Determine input device ---
     # Find the first CUDA device in the model's device map
     input_device = torch.device("cuda:0")  # default fallback
     if hasattr(model, "hf_device_map") and isinstance(model.hf_device_map, dict):
         for _, d in model.hf_device_map.items():
-            if isinstance(d, str) and d.startswith("cuda"):
-                input_device = torch.device(d)
-                break
-    # Also check base model's device map
-    elif hasattr(model.base_model, "model") and hasattr(model.base_model.model, "hf_device_map"):
-        for _, d in model.base_model.model.hf_device_map.items():
-            if isinstance(d, str) and d.startswith("cuda"):
-                input_device = torch.device(d)
-                break
+            if isinstance(d, (int, str)):
+                dev_str = str(d)
+                if dev_str.isdigit():
+                    input_device = torch.device(f"cuda:{dev_str}")
+                    break
+                elif dev_str.startswith("cuda"):
+                    input_device = torch.device(dev_str)
+                    break
+
+    # Warmup: run a dummy forward pass to initialize CUDA kernels and KV cache
+    logger.info("🔥 Running warmup inference...")
+    warmup_ids = tokenizer("warmup", return_tensors="pt").input_ids.to(input_device)
+    with torch.no_grad():
+        model.generate(warmup_ids, max_new_tokens=5, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    del warmup_ids
+    torch.cuda.empty_cache()
+    logger.info("   Warmup complete.")
 
     elapsed = time.time() - start
 
@@ -284,7 +305,7 @@ async def generate_text(req: GenerateRequest):
 
         # Tokenize and move to the correct GPU
         inputs = tokenizer(
-            req.prompt, return_tensors="pt", truncation=True, max_length=2048
+            req.prompt, return_tensors="pt", truncation=True, max_length=512
         )
         inputs = {k: v.to(input_device) for k, v in inputs.items()}
         input_length = inputs["input_ids"].shape[1]
@@ -386,7 +407,7 @@ async def ask(req: AskRequest):
 
 
 @app.post(
-    "/chat",
+    "/child-chat",
     response_model=ChildChatResponse,
     dependencies=[Depends(verify_api_key)],
 )
@@ -395,10 +416,10 @@ async def child_chat(req: ChildChatRequest):
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
-    # Build conversation history (keep last 6 turns)
+    # Build conversation history (keep last 4 turns for speed)
     history_text = ""
     if req.conversation_history:
-        history_text = "\n".join(req.conversation_history[-6:])
+        history_text = "\n".join(req.conversation_history[-4:])
 
     # Build prompt
     phoneme_line = (
@@ -420,7 +441,7 @@ async def child_chat(req: ChildChatRequest):
     # Generate — keep max_new_tokens low for fast conversational responses
     gen_req = GenerateRequest(
         prompt=prompt,
-        max_new_tokens=50,
+        max_new_tokens=35,
         temperature=0.6,
         top_p=0.85,
         top_k=40,

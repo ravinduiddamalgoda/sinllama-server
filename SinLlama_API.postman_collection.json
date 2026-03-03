@@ -309,9 +309,9 @@
 							"raw": "{\n  \"child_utterance\": \"මට කතාවක් කියන්න\",\n  \"child_name\": \"කවිඳු\",\n  \"target_phoneme\": \"ක\"\n}"
 						},
 						"url": {
-							"raw": "{{baseUrl}}/chat",
+							"raw": "{{baseUrl}}/child-chat",
 							"host": ["{{baseUrl}}"],
-							"path": ["chat"]
+							"path": ["child-chat"]
 						}
 					},
 					"status": "OK",
