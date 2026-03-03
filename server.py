@@ -238,6 +238,9 @@ class ChildChatRequest(BaseModel):
     )
     attempt_number: int = Field(default=1, ge=1, le=10, description="Which attempt this is for the current word")
     session_words: list[str] = Field(default=[], description="All words in this session (e.g. ['බල්ලා','පූසා','අලියා'])")
+    next_word: str = Field(default="", description="The next word to move to (sent when current word is correct or skipped)")
+    words_completed: int = Field(default=0, ge=0, description="Number of words completed so far in this session")
+    is_session_complete: bool = Field(default=False, description="True when all 3 words are done")
 
 
 class ChildChatResponse(BaseModel):
@@ -439,8 +442,14 @@ async def child_chat(req: ChildChatRequest):
 
     # Build situation description based on pronunciation result
     situation = ""
-    if req.pronunciation_result == "correct":
-        situation = f"දරුවා '{req.current_word}' නිවැරදිව කිව්වා! සතුටින් ප්‍රශංසා කරන්න, වචනය ගැන කුඩා රසවත් කතාවක් කියන්න."
+    if req.is_session_complete:
+        total = len(req.session_words) if req.session_words else 3
+        situation = f"Session එක ඉවරයි! දරුවා {req.words_completed}/{total} වචන හරියට කිව්වා. ඉතා සතුටින් අවසාන ප්‍රශංසා කරන්න. 'ඔයා champion එකක්!', 'හෙට ආයෙත් ඉගෙන ගමු!' වගේ කියන්න."
+    elif req.pronunciation_result == "correct":
+        if req.next_word:
+            situation = f"දරුවා '{req.current_word}' නිවැරදිව කිව්වා! සතුටින් ප්‍රශංසා කරන්න, වචනය ගැන කුඩා රසවත් දෙයක් කියන්න. ඊට පස්සේ ඊළඟ වචනය '{req.next_word}' ගැන රසවත් විස්තරයක් කියලා '{req.next_word}' කියන්න කියන්න."
+        else:
+            situation = f"දරුවා '{req.current_word}' නිවැරදිව කිව්වා! සතුටින් ප්‍රශංසා කරන්න, වචනය ගැන කුඩා රසවත් කතාවක් කියන්න."
     elif req.pronunciation_result == "close":
         situation = f"දරුවා '{req.current_word}' ආසන්නව කිව්වා, නමුත් තව ටිකක් හොඳ කරන්න ඕනේ. දිරිමත් කරලා නැවත කියන්න කියන්න."
     elif req.pronunciation_result == "retry":
@@ -454,7 +463,10 @@ async def child_chat(req: ChildChatRequest):
         else:
             situation = f"දරුවා කතා කළේ නැහැ. '{req.current_word}' ගැන රසවත් දෙයක් කියලා කියන්න බය වෙන්න එපා කියන්න."
     elif req.pronunciation_result == "skipped":
-        situation = f"'{req.current_word}' මඟ හැරියා. කමක් නැත කියන්න, ඊළඟ වචනයට යමු කියන්න."
+        if req.next_word:
+            situation = f"'{req.current_word}' මඟ හැරියා. කමක් නැත කියන්න, ඊළඟ වචනය '{req.next_word}' ගැන රසවත් විස්තරයක් කියලා '{req.next_word}' කියන්න කියන්න."
+        else:
+            situation = f"'{req.current_word}' මඟ හැරියා. කමක් නැත කියන්න, පසුව ආයෙත් උත්සාහ කරමු කියන්න."
     elif req.pronunciation_result == "new_word":
         situation = f"අලුත් වචනයක් හඳුන්වා දෙන්න: '{req.current_word}'. මේ වචනය ගැන කුඩා රසවත් විස්තරයක් කියලා, දරුවාට කියන්න කියන්න."
 
