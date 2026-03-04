@@ -500,7 +500,7 @@ async def child_chat(req: ChildChatRequest):
     gen_req = GenerateRequest(
         prompt=prompt,
         max_new_tokens=60,
-        temperature=0.5,
+        temperature=0.2,
         top_p=0.9,
         top_k=50,
         repetition_penalty=1.3,
