@@ -1202,12 +1202,32 @@ async def diarize_audio(
             )
 
         # Collect speaker segments (skip very short bursts < 0.4s)
-        # pyannote.audio v4.x returns DiarizeOutput; v3.x returns Annotation directly
-        annotation = diarization_result
-        if hasattr(diarization_result, "to_annotation"):
+        # pyannote.audio v4.x returns DiarizeOutput; handle multiple access patterns
+        annotation = None
+        if hasattr(diarization_result, "itertracks"):
+            annotation = diarization_result
+        elif hasattr(diarization_result, "to_annotation"):
             annotation = diarization_result.to_annotation()
         elif hasattr(diarization_result, "annotation"):
             annotation = diarization_result.annotation
+        elif isinstance(diarization_result, tuple) and len(diarization_result) > 0:
+            annotation = diarization_result[0]
+        else:
+            # Last resort: try indexing
+            try:
+                annotation = diarization_result[0]
+            except (IndexError, TypeError, KeyError):
+                pass
+
+        if annotation is None or not hasattr(annotation, "itertracks"):
+            logger.error(
+                f"Cannot extract annotation from {type(diarization_result).__name__}. "
+                f"Available attrs: {[a for a in dir(diarization_result) if not a.startswith('_')]}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unsupported diarization output type: {type(diarization_result).__name__}",
+            )
 
         raw_segments = []
         for turn, _, speaker in annotation.itertracks(yield_label=True):
