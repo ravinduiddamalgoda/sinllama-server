@@ -1629,7 +1629,7 @@ async def diarize_audio(
 
         asr_time_ms = (time.time() - asr_start) * 1000
         logger.info(
-            f"   ASR complete: {len(per_seg_results)} segments in {asr_time_ms:.0f}ms"
+            f"   ASR complete: {len(segments_for_llm)} segments in {asr_time_ms:.0f}ms"
         )
 
         # ── Step 5: Detect Overlapping Speaker Regions ──
