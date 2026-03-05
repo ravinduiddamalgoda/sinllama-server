@@ -410,6 +410,103 @@ def _get_word_description(word: str) -> str:
     return WORD_KNOWLEDGE.get(word, "")
 
 
+import random
+
+
+def _build_child_response(req) -> str | None:
+    """Build a template-based response for structured pronunciation scenarios.
+    Returns None if the scenario needs LLM generation (free conversation)."""
+
+    name = req.child_name or "ළමයා"
+    word = req.current_word
+    nxt = req.next_word
+    desc = _get_word_description(word) if word else ""
+    next_desc = _get_word_description(nxt) if nxt else ""
+
+    # --- Session Complete ---
+    if req.is_session_complete:
+        total = len(req.session_words) if req.session_words else 3
+        templates = [
+            f"වාව් {name}! ඔයා අද වචන {req.words_completed}ක් හරියට කිව්වා! ඔයා හරිම දක්ෂයි! හෙට ආයෙත් ඉගෙන ගමු!",
+            f"සුපිරි {name}! අද session එක ඉවරයි! {req.words_completed}/{total} වචන හරියට කිව්වා. ඔයා champion කෙනෙක්! හෙට ආයෙත් එමුද?",
+            f"හොඳයි {name}! අද අපි වචන {req.words_completed}ක් ඉගෙන ගත්තා! ඔයාට පුළුවන් කියලා පෙන්නුවා! හෙට තව වචන ඉගෙන ගමු!",
+        ]
+        return random.choice(templates)
+
+    # --- Correct + Transition to Next Word ---
+    if req.pronunciation_result == "correct" and nxt:
+        praise_parts = [
+            f"වාව් {name}! '{word}' හරියටම කිව්වා!",
+            f"සුපිරි {name}! '{word}' නිවැරදියි!",
+            f"හරිම හොඳයි {name}! '{word}' හරියට කිව්වා!",
+        ]
+        praise = random.choice(praise_parts)
+        if desc:
+            praise += f" {desc}"
+        # Introduce next word
+        intro = f" දැන් අපි '{nxt}' ගැන ඉගෙන ගමු."
+        if next_desc:
+            intro += f" {next_desc}"
+        intro += f" {name}, '{nxt}' කියන්න පුළුවන්ද?"
+        return praise + intro
+
+    # --- Correct (last word, no next) ---
+    if req.pronunciation_result == "correct":
+        templates = [
+            f"වාව් {name}! '{word}' හරියටම කිව්වා! {desc} ඔයා හරිම දක්ෂයි!" if desc else f"වාව් {name}! '{word}' හරියටම කිව්වා! ඔයා හරිම දක්ෂයි!",
+            f"සුපිරි {name}! '{word}' නිවැරදියි! {desc} ඔයාට පුළුවන්!" if desc else f"සුපිරි {name}! '{word}' නිවැරදියි! ඔයාට පුළුවන්!",
+        ]
+        return random.choice(templates)
+
+    # --- Close (almost correct) ---
+    if req.pronunciation_result == "close":
+        templates = [
+            f"හොඳයි {name}! '{word}' ආසන්නයි! {desc} තව පොඩ්ඩක් උත්සාහ කරමු. '{word}' ආයේ කියන්නකෝ!" if desc else f"හොඳයි {name}! '{word}' ආසන්නයි! තව පොඩ්ඩක් උත්සාහ කරමු. '{word}' ආයේ කියන්නකෝ!",
+            f"වාව් {name}! ඔයා ආසන්නයි! {desc} '{word}' ආයෙත් කියන්න, ඔයාට පුළුවන්!" if desc else f"වාව් {name}! ඔයා ආසන්නයි! '{word}' ආයෙත් කියන්න, ඔයාට පුළුවන්!",
+        ]
+        return random.choice(templates)
+
+    # --- Retry (incorrect) ---
+    if req.pronunciation_result == "retry":
+        templates = [
+            f"බය වෙන්න එපා {name}! '{word}' ගැන බලමු. {desc} ආයෙත් '{word}' කියන්නකෝ!" if desc else f"බය වෙන්න එපා {name}! ආයෙත් '{word}' කියන්නකෝ, ඔයාට පුළුවන්!",
+            f"කමක් නැහැ {name}! අපි ආයෙත් උත්සාහ කරමු. {desc} '{word}' කියන්න පුළුවන්ද?" if desc else f"කමක් නැහැ {name}! ආයෙත් උත්සාහ කරමු. '{word}' කියන්න පුළුවන්ද?",
+            f"{name}, ටිකක් අමාරුද? {desc} හරි, ආයෙත් '{word}' කියන්නකෝ!" if desc else f"{name}, ටිකක් අමාරුද? හරි, ආයෙත් '{word}' කියන්නකෝ!",
+        ]
+        return random.choice(templates)
+
+    # --- No Speech ---
+    if req.pronunciation_result == "no_speech":
+        templates = [
+            f"{name}, බය වෙන්න එපා! අපි එකට ඉගෙන ගමු. {desc} '{word}' කියන්න පුළුවන්ද?" if desc else f"{name}, බය වෙන්න එපා! '{word}' කියන්න උත්සාහ කරන්නකෝ!",
+            f"හරි {name}, බය වෙන්න එපා! {desc} '{word}' කියන්න පුළුවන්ද? ඔයාට පුළුවන්!" if desc else f"හරි {name}, බය වෙන්න එපා! '{word}' කියන්න, ඔයාට පුළුවන්!",
+        ]
+        return random.choice(templates)
+
+    # --- Skipped + Next Word ---
+    if req.pronunciation_result == "skipped" and nxt:
+        intro = f"කමක් නැහැ {name}! පස්සේ '{word}' ආයෙත් උත්සාහ කරමු. දැන් අපි '{nxt}' ගැන ඉගෙන ගමු."
+        if next_desc:
+            intro += f" {next_desc}"
+        intro += f" {name}, '{nxt}' කියන්න පුළුවන්ද?"
+        return intro
+
+    # --- Skipped (no next) ---
+    if req.pronunciation_result == "skipped":
+        return f"කමක් නැහැ {name}! පස්සේ ආයෙත් උත්සාහ කරමු. ඔයා හොඳට කරනවා!"
+
+    # --- New Word Introduction ---
+    if req.pronunciation_result == "new_word":
+        templates = [
+            f"{name}, අද අපි '{word}' ගැන ඉගෙන ගමු! {desc} '{word}' කියන්න පුළුවන්ද?" if desc else f"{name}, අද අපි '{word}' ගැන ඉගෙන ගමු! '{word}' කියන්න පුළුවන්ද?",
+            f"හරි {name}! අලුත් වචනයක්! {desc} '{word}' කියන්නකෝ!" if desc else f"හරි {name}! අලුත් වචනයක්! '{word}' කියන්නකෝ!",
+        ]
+        return random.choice(templates)
+
+    # --- No matching scenario → use LLM for free conversation ---
+    return None
+
+
 @app.get("/health")
 async def health_check():
     """Health check — no auth required."""
@@ -558,76 +655,53 @@ async def ask(req: AskRequest):
     dependencies=[Depends(verify_api_key)],
 )
 async def child_chat(req: ChildChatRequest):
-    """Child conversation endpoint with Sinhala prompt formatting."""
+    """Child conversation endpoint — uses pre-built templates for pronunciation
+    scenarios (instant, reliable) and falls back to LLM only for free conversation."""
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
-    # Build conversation history (keep last 4 turns for speed)
+    start_time = time.time()
+
+    # Try template-based response first (covers all structured scenarios)
+    template_response = _build_child_response(req)
+
+    if template_response is not None:
+        # Template hit — return instantly, no LLM call needed
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.info(
+            f"💬 Child-chat (template): {len(template_response)} chars in {elapsed_ms:.0f}ms "
+            f"| result={req.pronunciation_result} word={req.current_word}"
+        )
+        return ChildChatResponse(
+            response=template_response,
+            inference_time_ms=round(elapsed_ms, 1),
+        )
+
+    # --- Free conversation fallback (no pronunciation_result) → use LLM ---
     history_text = ""
     if req.conversation_history:
         history_text = "\n".join(req.conversation_history[-4:])
 
-    # Get pre-built descriptions for current and next word
-    current_desc = _get_word_description(req.current_word) if req.current_word else ""
-    next_desc = _get_word_description(req.next_word) if req.next_word else ""
-
-    # Build the situation instruction with descriptions pre-injected
-    situation = ""
-    if req.is_session_complete:
-        total = len(req.session_words) if req.session_words else 3
-        situation = f"Session ඉවරයි! {req.words_completed}/{total} වචන හරියට කිව්වා. සතුටින් ප්‍රශංසා කරන්න, 'ඔයා champion!', 'හෙට ආයෙත් ඉගෙන ගමු!' කියන්න."
-    elif req.pronunciation_result == "correct":
-        praise = f"'{req.current_word}' හරියට කිව්වා! ප්‍රශංසා කරන්න."
-        if current_desc:
-            praise += f" {current_desc}"
-        if req.next_word:
-            transition = f" ඊට පස්සේ '{req.next_word}' ගැන කතා කරන්න."
-            if next_desc:
-                transition += f" {next_desc}"
-            transition += f" '{req.next_word}' කියන්න කියන්න."
-            situation = praise + transition
+    # If there's a current word, mention it in context
+    word_context = ""
+    if req.current_word:
+        desc = _get_word_description(req.current_word)
+        if desc:
+            word_context = f"දැන් ඉගෙන ගන්න වචනය: '{req.current_word}'. {desc}"
         else:
-            situation = praise
-    elif req.pronunciation_result == "close":
-        situation = f"'{req.current_word}' ආසන්නයි! දිරිමත් කරන්න."
-        if current_desc:
-            situation += f" {current_desc}"
-        situation += f" ආයෙත් '{req.current_word}' කියන්න කියන්න."
-    elif req.pronunciation_result == "retry":
-        situation = f"'{req.current_word}' තව පුහුණු වෙන්න ඕනේ. බය නොවෙන්න කියන්න."
-        if current_desc:
-            situation += f" {current_desc}"
-        situation += f" ආයෙත් '{req.current_word}' කියන්න කියන්න."
-    elif req.pronunciation_result == "no_speech":
-        situation = f"දරුවා කතා කළේ නැහැ. දිරිමත් කරන්න, බය වෙන්න එපා කියන්න."
-        if current_desc:
-            situation += f" {current_desc}"
-        situation += f" '{req.current_word}' කියන්න කියන්න."
-    elif req.pronunciation_result == "skipped":
-        situation = f"'{req.current_word}' මඟ හැරියා. කමක් නැත කියන්න."
-        if req.next_word:
-            situation += f" '{req.next_word}' ගැන කතා කරන්න."
-            if next_desc:
-                situation += f" {next_desc}"
-            situation += f" '{req.next_word}' කියන්න කියන්න."
-    elif req.pronunciation_result == "new_word":
-        situation = f"අලුත් වචනයක්: '{req.current_word}'."
-        if current_desc:
-            situation += f" {current_desc}"
-        situation += f" '{req.current_word}' කියන්න කියන්න."
+            word_context = f"දැන් ඉගෙන ගන්න වචනය: '{req.current_word}'."
 
-    prompt = f"""ඔබ කුඩා දරුවන්ට සිංහල වචන උගන්වන මිත්‍රශීලී ගුරුවරියකි (අක්කා).
-{req.child_name}ට කතා කරන්න. කෙටි වාක්‍ය 2ක් පමණක්. සරල සිංහල.
-{situation}
+    prompt = f"""ඔබ කුඩා දරුවන්ට සිංහල වචන උගන්වන මිත්‍රශීලී ගුරුවරියකි.
+{req.child_name}ට කතා කරන්න. කෙටි වාක්‍ය 2ක්. සරල සිංහල.
+{word_context}
 
 {history_text}
 දරුවා: {req.child_utterance}
 ගුරුවරිය:"""
 
-    # Generate — reduced tokens, lower temperature for speed + consistency
     gen_req = GenerateRequest(
         prompt=prompt,
-        max_new_tokens=45,
+        max_new_tokens=40,
         temperature=0.4,
         top_p=0.85,
         top_k=40,
@@ -636,14 +710,13 @@ async def child_chat(req: ChildChatRequest):
 
     result = await generate_text(gen_req)
 
-    # Clean response — stop at continuation markers
+    # Clean response
     response_text = result.generated_text
     for stop_token in ["දරුවා:", "\n\n", "ගුරුවරිය:", "\nදරුවා", "\nගුරුවරිය"]:
         if stop_token in response_text:
             response_text = response_text.split(stop_token)[0].strip()
 
-    # Allow 2-3 sentences for conversational feel
-    response_text = _truncate_to_sentences(response_text, max_sentences=3)
+    response_text = _truncate_to_sentences(response_text, max_sentences=2)
 
     return ChildChatResponse(
         response=response_text,
