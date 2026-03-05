@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI):
 
         diar_pipeline = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token if hf_token else None,
+            token=hf_token if hf_token else None,
         )
         # Place on GPU 1 alongside Whisper to keep GPU 0 free for LLM
         diar_device = 1 if num_gpus > 1 else 0
