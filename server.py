@@ -574,14 +574,21 @@ def _word_level_fuse(text_a: str, text_b: str) -> str:
         sim = _word_similarity(wa, wb)
 
         if sim >= 0.6:
-            # Similar words — pick the better one
-            # Prefer the one that looks more like a real Sinhala word (longer, no garble)
+            # Similar words — pick the better one using tokenizer validation
             if sim >= 0.9:
                 # Almost identical — prefer full-audio version (text_b)
                 result.append(wb)
             else:
-                # Moderately similar — pick longer word (more complete)
-                result.append(wb if len(wb) >= len(wa) else wa)
+                # Moderately similar — prefer the more meaningful word
+                a_meaningful = _is_meaningful_word(wa)
+                b_meaningful = _is_meaningful_word(wb)
+                if b_meaningful and not a_meaningful:
+                    result.append(wb)
+                elif a_meaningful and not b_meaningful:
+                    result.append(wa)
+                else:
+                    # Both meaningful or both garbled — prefer longer (more complete)
+                    result.append(wb if len(wb) >= len(wa) else wa)
             i += 1
             j += 1
         else:
@@ -607,39 +614,170 @@ def _word_level_fuse(text_a: str, text_b: str) -> str:
     return " ".join(result)
 
 
-def _llm_correct_word(word: str, context: str) -> str:
-    """Use LLM to suggest the most likely correct Sinhala word for a garbled ASR word.
+def _is_meaningful_word(word: str) -> bool:
+    """Check if a word is likely a real Sinhala word using SinLlama tokenizer.
     
-    Only called for heavily garbled words. Uses extremely tight token limits.
-    Returns the corrected word, or the original if LLM can't help.
+    A well-formed Sinhala word tokenizes efficiently into few subword tokens
+    because the tokenizer has learned common Sinhala morphemes.
+    Garbled/nonsense words fragment into many small character-level pieces,
+    indicating they're not in the model's learned vocabulary.
+    
+    Returns True if the word appears meaningful, False if likely garbled.
+    """
+    if tokenizer is None:
+        return True
+
+    if not word or len(word) <= 1:
+        return True  # Single chars / particles are fine
+
+    # Strip punctuation for analysis
+    clean = word.strip(".,!?;:\"'()[]{}។")
+    if not clean:
+        return True
+
+    # Tokenize the word in isolation
+    tokens = tokenizer.encode(clean, add_special_tokens=False)
+    token_count = len(tokens)
+    char_count = len(clean)
+
+    if token_count == 0:
+        return False  # Can't tokenize at all
+
+    # Heuristic thresholds based on Sinhala word structure:
+    # Real Sinhala words have efficient tokenization (model learned them).
+    # Garbled words have high token/char ratio because the tokenizer
+    # falls back to character-level or byte-level encoding.
+    #
+    # Examples (approximate):
+    #   "කතාකරන්න" (real) → ~2-3 tokens
+    #   "ඩයලායිශේෂයේෂ" (garbled) → ~8-12 tokens
+    #   "සම්බන්ධව" (real) → ~2 tokens
+
+    if char_count <= 4:
+        return token_count <= 3
+    elif char_count <= 8:
+        return token_count <= 5
+    elif char_count <= 14:
+        return token_count <= 6
+    else:
+        # For longer words, use ratio
+        # Normal Sinhala: ~0.3-0.5 tokens per char
+        # Garbled: >0.55 tokens per char
+        ratio = token_count / char_count
+        return ratio < 0.55
+
+
+def _predict_correct_word(
+    left_context: str,
+    garbled_word: str,
+    right_context: str = "",
+) -> str:
+    """Use SinLlama transformer to predict the correct word given context.
+    
+    Strategy (transformer-based prediction algorithm):
+    1. Feed left context to the model as a prompt
+    2. Run beam search to generate top-5 candidate next-word continuations
+    3. Extract the first word from each candidate beam
+    4. Score each candidate by:
+       - Character-level similarity to the garbled ASR word (they should
+         sound similar since ASR heard approximately the right phonemes)
+       - Tokenizer efficiency (real words tokenize cleanly)
+       - Length compatibility (shouldn't be wildly different length)
+    5. Return the highest-scoring candidate if it passes threshold
+    
+    This leverages:
+    - The model's knowledge of Sinhala word sequences (language model probability)
+    - The tokenizer's vocabulary as a dictionary of real words
+    - Edit distance as a phonetic similarity proxy
+    
+    Args:
+        left_context: Words before the garbled word
+        garbled_word: The word to correct
+        right_context: Words after (reserved for future bidirectional use)
+    
+    Returns:
+        The predicted correct word, or original garbled_word if no good prediction
     """
     if model is None or tokenizer is None:
-        return word
+        return garbled_word
 
-    prompt = f"වැරදි සිංහල වචනය නිවැරදි කරන්න. එක වචනයක් පමණක් ලියන්න.\nවාක්‍ය: {context}\nවැරදි: {word}\nනිවැරදි:"
+    # Need at least some context for prediction
+    prompt = left_context.rstrip()
+    if not prompt or len(prompt.split()) < 1:
+        return garbled_word
 
-    result = _llm_generate_internal(
-        prompt,
-        max_new_tokens=15,  # A single Sinhala word is at most ~10 tokens
-        temperature=0.1,
-        repetition_penalty=1.3,
-    )
+    prompt += " "
 
-    if not result:
-        return word
+    try:
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,
+        )
+        inputs = {k: v.to(input_device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].shape[1]
 
-    # Take only the first word from the result
-    result_word = result.split()[0].strip(".,!?;:\"'()[]{}") if result.split() else ""
+        # Beam search: generate top-5 candidate continuations
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=8,    # Enough tokens for one Sinhala word
+                num_beams=5,
+                num_return_sequences=5,
+                early_stopping=True,
+                do_sample=False,      # Pure beam search (deterministic)
+                pad_token_id=tokenizer.eos_token_id,
+            )
 
-    # Reject if result is way too different from input (hallucination)
-    if not result_word:
-        return word
-    if len(result_word) > len(word) * 3:
-        return word  # Too long — hallucination
-    if _word_similarity(word, result_word) < 0.2 and len(word) > 3:
-        return word  # Too different — likely hallucination
+        # Extract first word from each beam's output
+        candidates = []
+        for seq in outputs:
+            new_tokens = seq[input_len:]
+            new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            if new_text:
+                first_word = new_text.split()[0].strip(".,!?;:\"'()[]{}។")
+                if first_word and first_word not in candidates:
+                    candidates.append(first_word)
 
-    return result_word
+        if not candidates:
+            return garbled_word
+
+        # Score each candidate
+        best_word = garbled_word
+        best_score = 0.0
+
+        for cand in candidates:
+            # (a) Similarity to garbled word (phonetic proximity)
+            sim = _word_similarity(cand, garbled_word)
+
+            # (b) Bonus for being a meaningful word (clean tokenization)
+            meaningful_bonus = 1.25 if _is_meaningful_word(cand) else 0.8
+
+            # (c) Length compatibility — similar length words are preferred
+            len_ratio = min(len(cand), len(garbled_word)) / max(len(cand), len(garbled_word))
+            len_bonus = 0.6 + 0.4 * len_ratio  # range 0.6 to 1.0
+
+            score = sim * meaningful_bonus * len_bonus
+
+            if score > best_score:
+                best_score = score
+                best_word = cand
+
+        # Accept prediction only if score is reasonable
+        # 0.25 threshold prevents completely unrelated predictions
+        if best_score >= 0.25:
+            logger.info(
+                f"      Transformer predict: '{garbled_word}' → '{best_word}' "
+                f"(score={best_score:.3f}, candidates={candidates[:3]})"
+            )
+            return best_word
+
+        return garbled_word
+
+    except Exception as e:
+        logger.warning(f"Transformer word prediction failed for '{garbled_word}': {e}")
+        return garbled_word
 
 
 def _llm_correct_transcript(
@@ -647,15 +785,19 @@ def _llm_correct_transcript(
     full_audio_text: str,
     overlapping_regions: list[OverlappingRegion],
 ) -> list[dict]:
-    """Correct ASR transcript using word-level fusion + targeted LLM word correction.
+    """Correct ASR transcript using word-level fusion + transformer-based prediction.
     
-    Algorithm:
+    Pipeline:
     1. WORD-LEVEL FUSION: Merge per-segment ASR and full-audio aligned ASR
-       word-by-word using edit distance, picking the best word from each source.
-    2. TARGETED LLM CORRECTION: For remaining garbled words (detected by
-       character patterns), use LLM to suggest a single corrected word.
-    3. LENGTH GUARD: Output must be similar length to input — reject any
-       segment where output is >1.5x the input word count.
+       word-by-word using edit distance, picking the best candidate from each.
+    2. TOKENIZER VALIDATION: For each word in the fused text, use the SinLlama
+       tokenizer to check if it's a meaningful Sinhala word (real words tokenize
+       efficiently; garbled words fragment into many subword pieces).
+    3. TRANSFORMER PREDICTION: For words that fail validation, feed the left
+       context to the SinLlama model and use beam search to predict the most
+       likely correct word. Score candidates by similarity to the garbled word
+       + tokenizer efficiency.
+    4. LENGTH GUARD: Reject output if word count explodes vs input.
     
     Args:
         segments: [{"speaker": str, "start": float, "end": float, "text": str, "aligned_text": str}, ...]
@@ -681,52 +823,61 @@ def _llm_correct_transcript(
             })
             continue
 
-        # Step 1: Word-level fusion of both ASR sources
+        # ── Step 1: Word-level fusion of both ASR sources ──
         fused_text = _word_level_fuse(raw_text, aligned_text)
         if not fused_text:
             fused_text = raw_text or aligned_text
 
-        # Step 2: Targeted LLM correction for garbled words
-        # Only correct words that look garbled (very long compound words,
-        # or words with unusual character repetitions)
+        # ── Step 2 & 3: Tokenizer validation + Transformer prediction ──
         if model is not None and tokenizer is not None:
             words = fused_text.split()
             corrected_words = []
-            garbled_count = 0
+            prediction_count = 0
+            MAX_PREDICTIONS_PER_SEGMENT = 8  # Cap transformer calls per segment
 
-            for w in words:
-                is_garbled = False
-                # Detect garbled words:
-                # - Unusually long for Sinhala (>20 chars without spaces)
-                # - Contains repeated character patterns
-                # - Has very unusual character density
-                if len(w) > 20:
-                    is_garbled = True
-                elif len(w) > 10 and any(w.count(c) > 3 for c in set(w) if c not in "්ා ි ී ු ූ ෙ ේ ො ෝ"):
-                    is_garbled = True
-
-                if is_garbled and garbled_count < 5:  # Max 5 LLM calls per segment
-                    corrected_word = _llm_correct_word(w, fused_text)
-                    corrected_words.append(corrected_word)
-                    garbled_count += 1
-                    if corrected_word != w:
-                        logger.info(f"      Word fix: '{w}' → '{corrected_word}'")
-                else:
+            for word_idx, w in enumerate(words):
+                # Check if this word is meaningful using tokenizer
+                if _is_meaningful_word(w):
                     corrected_words.append(w)
+                else:
+                    # Word failed tokenizer validation — it's likely garbled
+                    if prediction_count < MAX_PREDICTIONS_PER_SEGMENT:
+                        # Build left context from already-corrected words
+                        left_ctx = " ".join(corrected_words[-6:])  # last 6 words as context
+
+                        # Build right context from remaining words
+                        right_ctx = " ".join(words[word_idx + 1:word_idx + 4])
+
+                        predicted = _predict_correct_word(left_ctx, w, right_ctx)
+                        corrected_words.append(predicted)
+                        prediction_count += 1
+
+                        if predicted != w:
+                            logger.info(
+                                f"      [{seg['speaker']}] Word {word_idx}: "
+                                f"'{w}' → '{predicted}' (tokenizer flagged as garbled)"
+                            )
+                    else:
+                        corrected_words.append(w)  # Budget exceeded, keep as-is
 
             final_text = " ".join(corrected_words)
+
+            if prediction_count > 0:
+                logger.info(
+                    f"   Segment {i+1}: {prediction_count} words corrected by transformer"
+                )
         else:
             final_text = fused_text
 
-        # Step 3: Length guard — reject if output is wildly different from input
+        # ── Step 4: Length guard ──
         input_words = len((raw_text or aligned_text).split())
         output_words = len(final_text.split())
         if input_words > 0 and output_words > input_words * 2:
             logger.warning(
                 f"   Length guard: output ({output_words}w) > 2x input ({input_words}w), "
-                f"using raw ASR instead"
+                f"using fused text instead"
             )
-            final_text = raw_text or aligned_text
+            final_text = fused_text
 
         corrected.append({
             "speaker": seg["speaker"],
@@ -738,7 +889,7 @@ def _llm_correct_transcript(
         logger.info(
             f"   Correction [{i+1}/{len(segments)}] {seg['speaker']} "
             f"({seg['start']:.1f}-{seg['end']:.1f}s): "
-            f"'{(raw_text or '')[:40]}' → '{final_text[:40]}'"
+            f"'{(raw_text or '')[:50]}' → '{final_text[:50]}'"
         )
 
     return corrected
