@@ -1202,22 +1202,18 @@ async def diarize_audio(
             )
 
         # Collect speaker segments (skip very short bursts < 0.4s)
-        # pyannote.audio v4.x returns DiarizeOutput; handle multiple access patterns
+        # pyannote.audio v4.x returns DiarizeOutput with .speaker_diarization attribute
         annotation = None
         if hasattr(diarization_result, "itertracks"):
+            # Direct Annotation object (v3.x style)
             annotation = diarization_result
+        elif hasattr(diarization_result, "speaker_diarization"):
+            # pyannote.audio v4.x DiarizeOutput
+            annotation = diarization_result.speaker_diarization
         elif hasattr(diarization_result, "to_annotation"):
             annotation = diarization_result.to_annotation()
-        elif hasattr(diarization_result, "annotation"):
-            annotation = diarization_result.annotation
-        elif isinstance(diarization_result, tuple) and len(diarization_result) > 0:
-            annotation = diarization_result[0]
         else:
-            # Last resort: try indexing
-            try:
-                annotation = diarization_result[0]
-            except (IndexError, TypeError, KeyError):
-                pass
+            annotation = None
 
         if annotation is None or not hasattr(annotation, "itertracks"):
             logger.error(
