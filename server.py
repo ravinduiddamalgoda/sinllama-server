@@ -17,6 +17,8 @@ from typing import Optional
 import tempfile
 import shutil
 import json as _json
+import numpy as np
+import torchaudio
 
 # === Configuration ===
 BASE_MODEL_PATH = "/workspace/models/llama-3-8b-base"
@@ -50,13 +52,14 @@ model = None
 tokenizer = None
 input_device = None  # device where input tensors should be placed
 asr_pipe = None  # Whisper ASR pipeline
+diar_pipeline = None  # pyannote speaker diarization pipeline
 
 
 # === Model Loading ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, cleanup on shutdown."""
-    global model, tokenizer, input_device, asr_pipe
+    global model, tokenizer, input_device, asr_pipe, diar_pipeline
 
     # Set memory config for better allocation across 2 GPUs
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -190,11 +193,39 @@ async def lifespan(app: FastAPI):
         total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
         logger.info(f"   GPU {i}: {alloc:.2f} / {total_mem:.1f} GB used (after ASR)")
 
+    # --- Step 6: Load pyannote Speaker Diarization Pipeline ---
+    logger.info("🗣️ Loading pyannote speaker diarization pipeline...")
+    try:
+        from pyannote.audio import Pipeline as PyannotePipeline
+
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if not hf_token:
+            logger.warning("   ⚠️ HF_TOKEN env var not set. Diarization may fail if models aren't cached.")
+
+        diar_pipeline = PyannotePipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token if hf_token else None,
+        )
+        # Place on GPU 1 alongside Whisper to keep GPU 0 free for LLM
+        diar_device = 1 if num_gpus > 1 else 0
+        diar_pipeline.to(torch.device(f"cuda:{diar_device}"))
+        logger.info(f"   Diarization pipeline loaded on GPU {diar_device}")
+        for i in range(num_gpus):
+            alloc = torch.cuda.memory_allocated(i) / 1e9
+            total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+            logger.info(f"   GPU {i}: {alloc:.2f} / {total_mem:.1f} GB used (after diarization)")
+    except Exception as e:
+        logger.error(f"   ❌ Failed to load diarization pipeline: {e}")
+        logger.error("   Diarization endpoint (/diarize) will be unavailable.")
+        logger.error("   Install: pip install pyannote.audio")
+        logger.error("   Set HF_TOKEN env var with your HuggingFace token.")
+        diar_pipeline = None
+
     yield  # Server runs here
 
     # Cleanup
     logger.info("🧹 Shutting down, releasing GPU memory...")
-    del model, tokenizer, asr_pipe
+    del model, tokenizer, asr_pipe, diar_pipeline
     torch.cuda.empty_cache()
     logger.info("👋 Server stopped.")
 
@@ -282,6 +313,28 @@ class ChildSessionResponse(BaseModel):
     asr_time_ms: float = Field(description="Time taken for speech-to-text (ms)")
     chat_time_ms: float = Field(description="Time taken for response generation (ms)")
     total_time_ms: float = Field(description="Total end-to-end time (ms)")
+
+
+class DiarizeSegment(BaseModel):
+    """A single speaker-labeled transcript segment."""
+    speaker: str = Field(description="Speaker label (e.g. SPEAKER_00)")
+    start: float = Field(description="Segment start time in seconds")
+    end: float = Field(description="Segment end time in seconds")
+    duration: float = Field(description="Segment duration in seconds")
+    text: str = Field(description="Transcribed Sinhala text for this segment")
+
+
+class DiarizeResponse(BaseModel):
+    """Speaker diarization + transcription response."""
+    num_speakers: int = Field(description="Number of distinct speakers detected")
+    speakers: list[str] = Field(description="List of speaker labels")
+    total_segments: int = Field(description="Total number of transcript segments")
+    segments: list[DiarizeSegment] = Field(description="Speaker-labeled transcript segments")
+    transcript_text: str = Field(description="Full transcript with speaker labels, one line per segment")
+    audio_duration_s: float = Field(description="Total audio duration in seconds")
+    diarization_time_ms: float = Field(description="Time for speaker diarization (ms)")
+    transcription_time_ms: float = Field(description="Time for per-segment ASR transcription (ms)")
+    total_time_ms: float = Field(description="Total end-to-end processing time (ms)")
 
 
 # === Helpers ===
@@ -458,14 +511,29 @@ def _build_child_response(req) -> str | None:
     nxt = req.next_word
     desc = _get_word_description(word) if word else ""
     next_desc = _get_word_description(nxt) if nxt else ""
+    total = len(req.session_words) if req.session_words else 3
+    completed = req.words_completed if req.words_completed else 0
+
+    # --- Auto-detect session complete ---
+    # If is_session_complete is explicitly set, OR if the last word was correct/skipped
+    # with no next word and completed >= total, treat as session complete
+    session_done = req.is_session_complete
+    if not session_done and req.pronunciation_result in ("correct", "skipped") and not nxt:
+        if completed >= total or (req.session_words and word == req.session_words[-1]):
+            session_done = True
 
     # --- Session Complete ---
-    if req.is_session_complete:
-        total = len(req.session_words) if req.session_words else 3
+    if session_done:
+        # If last word was correct, praise it first then end session
+        praise = ""
+        if req.pronunciation_result == "correct" and word:
+            praise = f"වාව් {name}! '{word}' හරියටම කිව්වා! "
+            if desc:
+                praise += f"{desc} "
         templates = [
-            f"වාව් {name}! ඔයා අද වචන {req.words_completed}ක් හරියට කිව්වා! ඔයා හරිම දක්ෂයි! හෙට ආයෙත් ඉගෙන ගමු!",
-            f"සුපිරි {name}! අද session එක ඉවරයි! {req.words_completed}/{total} වචන හරියට කිව්වා. ඔයා champion කෙනෙක්! හෙට ආයෙත් එමුද?",
-            f"හොඳයි {name}! අද අපි වචන {req.words_completed}ක් ඉගෙන ගත්තා! ඔයාට පුළුවන් කියලා පෙන්නුවා! හෙට තව වචන ඉගෙන ගමු!",
+            f"{praise}සුපිරි {name}! අද session එක ඉවරයි! වචන {completed}/{total}ක් හරියට කිව්වා. ඔයා champion කෙනෙක්! හෙට ආයෙත් ඉගෙන ගමු!",
+            f"{praise}වාව් {name}! ඔයා අද වචන {completed}ක් ඉගෙන ගත්තා! ඔයා හරිම දක්ෂයි! හෙට ආයෙත් එමුද?",
+            f"{praise}හොඳයි {name}! අද අපි වචන {completed}ක් ඉගෙන ගත්තා! ඔයාට පුළුවන් කියලා පෙන්නුවා! හෙට තව වචන ඉගෙන ගමු!",
         ]
         return random.choice(templates)
 
@@ -486,11 +554,11 @@ def _build_child_response(req) -> str | None:
         intro += f" {name}, '{nxt}' කියන්න පුළුවන්ද?"
         return praise + intro
 
-    # --- Correct (last word, no next) ---
+    # --- Correct (mid-session, no next word provided — ask client to send next_word) ---
     if req.pronunciation_result == "correct":
         templates = [
-            f"වාව් {name}! '{word}' හරියටම කිව්වා! {desc} ඔයා හරිම දක්ෂයි!" if desc else f"වාව් {name}! '{word}' හරියටම කිව්වා! ඔයා හරිම දක්ෂයි!",
-            f"සුපිරි {name}! '{word}' නිවැරදියි! {desc} ඔයාට පුළුවන්!" if desc else f"සුපිරි {name}! '{word}' නිවැරදියි! ඔයාට පුළුවන්!",
+            f"වාව් {name}! '{word}' හරියටම කිව්වා! {desc} ඔයා හරිම දක්ෂයි! ඊළඟ වචනයට යමුද?" if desc else f"වාව් {name}! '{word}' හරියටම කිව්වා! ඔයා හරිම දක්ෂයි! ඊළඟ වචනයට යමුද?",
+            f"සුපිරි {name}! '{word}' නිවැරදියි! {desc} ඔයාට පුළුවන්! ඊළඟ වචනයට යමු!" if desc else f"සුපිරි {name}! '{word}' නිවැරදියි! ඔයාට පුළුවන්! ඊළඟ වචනයට යමු!",
         ]
         return random.choice(templates)
 
@@ -563,6 +631,7 @@ async def health_check():
     return {
         "status": "healthy" if model is not None else "loading",
         "model_loaded": model is not None,
+        "diarization_loaded": diar_pipeline is not None,
         "gpu_count": torch.cuda.device_count(),
         "input_device": str(input_device) if input_device else None,
         "gpus": gpu_info,
@@ -1025,6 +1094,218 @@ async def child_session(
         chat_time_ms=round(chat_time_ms, 1),
         total_time_ms=round(total_ms, 1),
     )
+
+
+# === Speaker Diarization + ASR Endpoint ===
+@app.post(
+    "/diarize",
+    response_model=DiarizeResponse,
+    dependencies=[Depends(verify_api_key)],
+    summary="Speaker Diarization + Sinhala ASR",
+    description="""
+Upload an audio file to get a speaker-labeled Sinhala transcript.
+
+The server will:
+1. Run **pyannote speaker diarization** to identify who spoke when
+2. Transcribe each speaker segment using **Whisper Sinhala ASR**
+3. Return speaker-labeled transcript segments
+
+Typically handles **4-5 speakers** in a single recording.
+Supports wav, mp3, flac, ogg, and webm formats.
+
+**Form fields:**
+- `audio` (required): Audio file upload
+- `num_speakers` (optional): Exact number of speakers if known (skips auto-detection)
+- `min_speakers` (default 2): Minimum speakers for auto-detection
+- `max_speakers` (default 8): Maximum speakers for auto-detection
+""",
+)
+async def diarize_audio(
+    audio: UploadFile = File(..., description="Audio file (wav, mp3, flac, ogg, webm)"),
+    num_speakers: Optional[int] = Form(
+        default=None,
+        description="Known number of speakers (leave empty for auto-detect, typically 4-5)",
+    ),
+    min_speakers: int = Form(default=2, description="Minimum expected speakers for auto-detection"),
+    max_speakers: int = Form(default=8, description="Maximum expected speakers for auto-detection"),
+):
+    """Speaker diarization with per-speaker Sinhala transcription."""
+    if diar_pipeline is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Diarization model not loaded. "
+                "Ensure pyannote.audio is installed and HF_TOKEN env var is set. "
+                "You must also accept the model licenses on HuggingFace."
+            ),
+        )
+    if asr_pipe is None:
+        raise HTTPException(status_code=503, detail="ASR model not loaded yet.")
+
+    # Validate file type
+    allowed_types = {
+        "audio/wav", "audio/x-wav", "audio/wave",
+        "audio/mpeg", "audio/mp3",
+        "audio/flac", "audio/ogg", "audio/webm",
+        "application/octet-stream",
+    }
+    if audio.content_type and audio.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type: {audio.content_type}. Use wav, mp3, flac, ogg, or webm.",
+        )
+
+    total_start = time.time()
+    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    processed_path = None
+
+    try:
+        # Save uploaded file to temp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(audio.file, tmp)
+
+        # Ensure 16kHz mono (required by both diarization and ASR)
+        waveform, sr = torchaudio.load(tmp_path)
+        changed = False
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+            changed = True
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+            changed = True
+
+        if changed:
+            processed_path = tmp_path.replace(suffix, "_16k.wav")
+            torchaudio.save(processed_path, waveform, 16000)
+            wav_path = processed_path
+        else:
+            wav_path = tmp_path
+
+        audio_duration = waveform.shape[1] / 16000
+        logger.info(
+            f"🗣️ Diarization request: {audio.filename} "
+            f"({audio_duration:.1f}s, {len(waveform[0]) / 1024:.0f} KB samples)"
+        )
+
+        # ── Step 1: Speaker Diarization ──
+        diar_start = time.time()
+
+        if num_speakers is not None and num_speakers > 0:
+            diarization_result = diar_pipeline(wav_path, num_speakers=num_speakers)
+        else:
+            diarization_result = diar_pipeline(
+                wav_path,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+
+        # Collect speaker segments (skip very short bursts < 0.4s)
+        raw_segments = []
+        for turn, _, speaker in diarization_result.itertracks(yield_label=True):
+            duration = turn.end - turn.start
+            if duration < 0.4:
+                continue
+            raw_segments.append({
+                "speaker": speaker,
+                "start": round(turn.start, 3),
+                "end": round(turn.end, 3),
+            })
+
+        speakers_found = list(set(s["speaker"] for s in raw_segments))
+        diar_time_ms = (time.time() - diar_start) * 1000
+        logger.info(
+            f"   Diarization: {len(speakers_found)} speakers, "
+            f"{len(raw_segments)} segments in {diar_time_ms:.0f}ms"
+        )
+
+        # ── Step 2: Per-Segment Sinhala ASR ──
+        asr_start = time.time()
+        result_segments: list[DiarizeSegment] = []
+
+        for seg in raw_segments:
+            try:
+                # Extract audio slice for this speaker turn
+                start_frame = int(seg["start"] * 16000)
+                num_frames = int((seg["end"] - seg["start"]) * 16000)
+                seg_waveform = waveform[:, start_frame : start_frame + num_frames]
+
+                if seg_waveform.shape[1] < 1600:  # < 0.1s — skip
+                    continue
+
+                # Convert to numpy for ASR pipeline
+                audio_array = seg_waveform.squeeze().numpy().astype(np.float32)
+
+                # Transcribe using existing Whisper Sinhala pipeline
+                asr_result = asr_pipe(
+                    {"raw": audio_array, "sampling_rate": 16000},
+                )
+                text = asr_result["text"].strip()
+
+                if text:
+                    result_segments.append(
+                        DiarizeSegment(
+                            speaker=seg["speaker"],
+                            start=seg["start"],
+                            end=seg["end"],
+                            duration=round(seg["end"] - seg["start"], 3),
+                            text=text,
+                        )
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    f"   ASR failed for segment "
+                    f"{seg['start']:.1f}-{seg['end']:.1f}s: {e}"
+                )
+                continue
+
+        asr_time_ms = (time.time() - asr_start) * 1000
+        total_ms = (time.time() - total_start) * 1000
+
+        # Build human-readable transcript text
+        transcript_lines = []
+        for seg in result_segments:
+            ts = f"[{seg.start:.1f}s - {seg.end:.1f}s]"
+            transcript_lines.append(f"{ts} {seg.speaker}: {seg.text}")
+        transcript_text = "\n".join(transcript_lines)
+
+        all_speakers = sorted(set(s.speaker for s in result_segments))
+
+        logger.info(
+            f"🗣️ Diarization complete: {len(all_speakers)} speakers, "
+            f"{len(result_segments)} segments "
+            f"| diar={diar_time_ms:.0f}ms asr={asr_time_ms:.0f}ms total={total_ms:.0f}ms"
+        )
+
+        return DiarizeResponse(
+            num_speakers=len(all_speakers),
+            speakers=all_speakers,
+            total_segments=len(result_segments),
+            segments=result_segments,
+            transcript_text=transcript_text,
+            audio_duration_s=round(audio_duration, 2),
+            diarization_time_ms=round(diar_time_ms, 1),
+            transcription_time_ms=round(asr_time_ms, 1),
+            total_time_ms=round(total_ms, 1),
+        )
+
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=507,
+            detail="GPU out of memory during diarization. Try shorter audio.",
+        )
+    except Exception as e:
+        logger.error(f"Diarization error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Diarization failed: {str(e)}")
+    finally:
+        # Clean up temp files
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if processed_path and os.path.exists(processed_path):
+            os.unlink(processed_path)
 
 
 # === Main ===
