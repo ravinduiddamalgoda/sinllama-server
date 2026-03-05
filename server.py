@@ -316,30 +316,337 @@ class ChildSessionResponse(BaseModel):
 
 
 class DiarizeSegment(BaseModel):
-    """A single speaker-labeled transcript segment."""
+    """A single speaker-labeled transcript segment with both raw and AI-corrected text."""
     speaker: str = Field(description="Speaker label (e.g. SPEAKER_00)")
     start: float = Field(description="Segment start time in seconds")
     end: float = Field(description="Segment end time in seconds")
     duration: float = Field(description="Segment duration in seconds")
-    text: str = Field(description="Transcribed Sinhala text for this segment")
+    asr_text: str = Field(description="Original Whisper ASR transcription (raw, uncorrected)")
+    ai_corrected_text: str = Field(description="LLM-corrected transcription (AI-optimized)")
+    text: str = Field(description="Best available text (ai_corrected_text if available, else asr_text)")
+
+
+class OverlappingRegion(BaseModel):
+    """A region where multiple speakers are talking simultaneously."""
+    start: float = Field(description="Overlap start time in seconds")
+    end: float = Field(description="Overlap end time in seconds")
+    duration: float = Field(description="Overlap duration in seconds")
+    speakers: list[str] = Field(description="Speakers involved in this overlap")
 
 
 class DiarizeResponse(BaseModel):
-    """Speaker diarization + transcription response."""
+    """Speaker diarization + AI-optimized transcription response."""
     num_speakers: int = Field(description="Number of distinct speakers detected")
     speakers: list[str] = Field(description="List of speaker labels")
     total_segments: int = Field(description="Total number of transcript segments")
-    segments: list[DiarizeSegment] = Field(description="Speaker-labeled transcript segments")
-    transcript_text: str = Field(description="Full transcript with speaker labels, one line per segment")
+    segments: list[DiarizeSegment] = Field(description="Speaker-labeled segments with both raw ASR and AI-corrected text")
+    full_audio_transcript: str = Field(description="Full-audio Whisper ASR transcript (used as reference for optimization)")
+    overlapping_regions: list[OverlappingRegion] = Field(default=[], description="Regions where speakers overlap")
+    transcript_text: str = Field(description="AI-optimized full transcript with speaker labels, one line per segment")
+    raw_transcript_text: str = Field(description="Raw ASR full transcript with speaker labels, one line per segment")
     audio_duration_s: float = Field(description="Total audio duration in seconds")
     diarization_time_ms: float = Field(description="Time for speaker diarization (ms)")
-    transcription_time_ms: float = Field(description="Time for per-segment ASR transcription (ms)")
+    transcription_time_ms: float = Field(description="Time for full-audio + per-segment ASR (ms)")
+    ai_optimization_time_ms: float = Field(description="Time for LLM-based transcript correction (ms)")
     total_time_ms: float = Field(description="Total end-to-end processing time (ms)")
 
 
 # === Helpers ===
 
 import re
+
+
+# === Diarization Helper Functions ===
+
+def _detect_overlapping_regions(diar_segments: list[dict]) -> list[OverlappingRegion]:
+    """Detect time regions where multiple speakers talk simultaneously.
+    
+    Args:
+        diar_segments: list of {"speaker": str, "start": float, "end": float}
+    
+    Returns:
+        list of OverlappingRegion objects
+    """
+    if len(diar_segments) < 2:
+        return []
+
+    overlaps: list[OverlappingRegion] = []
+    for i in range(len(diar_segments)):
+        for j in range(i + 1, len(diar_segments)):
+            seg_a = diar_segments[i]
+            seg_b = diar_segments[j]
+
+            # Skip if same speaker
+            if seg_a["speaker"] == seg_b["speaker"]:
+                continue
+
+            # Calculate overlap
+            overlap_start = max(seg_a["start"], seg_b["start"])
+            overlap_end = min(seg_a["end"], seg_b["end"])
+
+            if overlap_start < overlap_end:
+                duration = round(overlap_end - overlap_start, 3)
+                if duration >= 0.2:  # Only flag overlaps >= 200ms
+                    overlaps.append(OverlappingRegion(
+                        start=round(overlap_start, 3),
+                        end=round(overlap_end, 3),
+                        duration=duration,
+                        speakers=sorted(set([seg_a["speaker"], seg_b["speaker"]])),
+                    ))
+
+    # Merge adjacent/overlapping overlap regions
+    if overlaps:
+        overlaps.sort(key=lambda x: x.start)
+        merged = [overlaps[0]]
+        for ovl in overlaps[1:]:
+            prev = merged[-1]
+            if ovl.start <= prev.end:
+                # Merge
+                merged[-1] = OverlappingRegion(
+                    start=prev.start,
+                    end=max(prev.end, ovl.end),
+                    duration=round(max(prev.end, ovl.end) - prev.start, 3),
+                    speakers=sorted(set(prev.speakers + ovl.speakers)),
+                )
+            else:
+                merged.append(ovl)
+        overlaps = merged
+
+    return overlaps
+
+
+def _align_chunks_to_speakers(
+    whisper_chunks: list[dict],
+    diar_segments: list[dict],
+) -> list[dict]:
+    """Align Whisper timestamp chunks to diarization speaker segments.
+    
+    For each diarization segment, find all Whisper chunks whose midpoint
+    falls within that segment's time range, and concatenate their text.
+    
+    Args:
+        whisper_chunks: [{"text": str, "timestamp": (start, end)}, ...]
+        diar_segments: [{"speaker": str, "start": float, "end": float}, ...]
+    
+    Returns:
+        list of {"speaker": str, "start": float, "end": float, "text": str}
+    """
+    aligned = []
+
+    for seg in diar_segments:
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        matched_texts = []
+
+        for chunk in whisper_chunks:
+            ts = chunk.get("timestamp")
+            if ts is None or ts[0] is None or ts[1] is None:
+                continue
+            chunk_start, chunk_end = ts
+            # Use chunk midpoint for assignment
+            chunk_mid = (chunk_start + chunk_end) / 2.0
+            if seg_start <= chunk_mid <= seg_end:
+                text = chunk.get("text", "").strip()
+                if text:
+                    matched_texts.append(text)
+
+        aligned_text = " ".join(matched_texts).strip()
+        aligned.append({
+            "speaker": seg["speaker"],
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": aligned_text,
+        })
+
+    return aligned
+
+
+def _llm_generate_internal(
+    prompt: str,
+    max_new_tokens: int = 512,
+    temperature: float = 0.3,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.2,
+) -> str:
+    """Run LLM inference directly (internal helper, no HTTP overhead).
+    
+    Returns the generated text, or empty string if model isn't loaded.
+    """
+    if model is None or tokenizer is None:
+        return ""
+
+    try:
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        )
+        inputs = {k: v.to(input_device) for k, v in inputs.items()}
+        input_length = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=50,
+                repetition_penalty=repetition_penalty,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        new_tokens = outputs[0][input_length:]
+        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    except Exception as e:
+        logger.warning(f"LLM internal generation failed: {e}")
+        return ""
+
+
+def _llm_correct_transcript(
+    segments: list[dict],
+    full_audio_text: str,
+    overlapping_regions: list[OverlappingRegion],
+) -> list[dict]:
+    """Use LLM to correct ASR transcript errors for each segment.
+    
+    Strategy:
+    - Send the full-audio transcript as reference context
+    - For each segment, provide the raw ASR text + aligned text + neighboring context
+    - Ask the LLM to produce a corrected version
+    - Process segments in batches for efficiency
+    
+    Args:
+        segments: [{"speaker": str, "start": float, "end": float, "text": str, "aligned_text": str}, ...]
+        full_audio_text: Full-audio Whisper transcript (higher quality reference)
+        overlapping_regions: Detected overlap regions
+    
+    Returns:
+        list of {"speaker": str, "start": float, "end": float, "text": str} with corrected text
+    """
+    if model is None or tokenizer is None:
+        logger.warning("LLM not loaded — skipping transcript correction")
+        return [{"speaker": s["speaker"], "start": s["start"], "end": s["end"],
+                 "text": s.get("aligned_text") or s["text"]} for s in segments]
+
+    corrected = []
+
+    # Build overlap info string for context
+    overlap_info = ""
+    if overlapping_regions:
+        overlap_parts = []
+        for ovl in overlapping_regions:
+            overlap_parts.append(
+                f"  {ovl.start:.1f}s-{ovl.end:.1f}s: {', '.join(ovl.speakers)}"
+            )
+        overlap_info = "කථිකයන් අතිච්ඡාදනය වූ කාල:\n" + "\n".join(overlap_parts) + "\n"
+
+    # Process each segment with LLM correction
+    for i, seg in enumerate(segments):
+        raw_text = seg["text"]
+        aligned_text = seg.get("aligned_text", "")
+        
+        # If both raw and aligned are empty, skip
+        if not raw_text and not aligned_text:
+            corrected.append({
+                "speaker": seg["speaker"],
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": "",
+            })
+            continue
+
+        # Build context from neighboring segments
+        prev_context = ""
+        next_context = ""
+        if i > 0 and segments[i - 1].get("aligned_text") or (i > 0 and segments[i - 1].get("text")):
+            prev_seg = segments[i - 1]
+            prev_text = prev_seg.get("aligned_text") or prev_seg["text"]
+            prev_context = f"පෙර කථිකයා ({prev_seg['speaker']}): {prev_text}\n"
+        if i < len(segments) - 1:
+            next_seg = segments[i + 1]
+            next_text = next_seg.get("aligned_text") or next_seg["text"]
+            if next_text:
+                next_context = f"ඊළඟ කථිකයා ({next_seg['speaker']}): {next_text}\n"
+
+        # Check if this segment is in an overlapping region
+        is_overlapping = False
+        for ovl in overlapping_regions:
+            if seg["start"] < ovl.end and seg["end"] > ovl.start:
+                is_overlapping = True
+                break
+
+        # Build the correction prompt
+        # Use both the per-segment ASR and aligned full-audio text for best results
+        best_input = aligned_text if aligned_text else raw_text
+        secondary_input = raw_text if aligned_text and raw_text != aligned_text else ""
+
+        prompt_parts = [
+            "ඔබ සිංහල ASR පිටපත් නිවැරදි කරන විශේෂඥයෙකි.",
+            "පහත දැක්වෙන ASR මගින් ලබාගත් පිටපතෙහි වැරදි වචන නිවැරදි කර, අර්ථවත් සිංහල වාක්‍ය බවට පත් කරන්න.",
+            "මුල් අර්ථය වෙනස් නොකරන්න. නව වචන එකතු නොකරන්න. ඇති දේ පමණක් නිවැරදි කරන්න.",
+            "",
+        ]
+
+        # Add full audio transcript as reference
+        if full_audio_text:
+            prompt_parts.append(f"සම්පූර්ණ හඬ පටිගත කිරීමේ ASR යොමුව: {full_audio_text}")
+            prompt_parts.append("")
+
+        if prev_context:
+            prompt_parts.append(prev_context.strip())
+        if next_context:
+            prompt_parts.append(next_context.strip())
+
+        if is_overlapping:
+            prompt_parts.append("(සටහන: මෙම කොටසේ කථිකයන් දෙදෙනෙකු එකවර කතා කරයි)")
+
+        prompt_parts.append("")
+        prompt_parts.append(f"{seg['speaker']} ({seg['start']:.1f}s-{seg['end']:.1f}s) ASR පිටපත: {best_input}")
+        if secondary_input:
+            prompt_parts.append(f"විකල්ප ASR: {secondary_input}")
+        prompt_parts.append(f"නිවැරදි පිටපත:")
+
+        prompt = "\n".join(prompt_parts)
+
+        # Generate correction
+        result = _llm_generate_internal(
+            prompt,
+            max_new_tokens=256,
+            temperature=0.3,
+            repetition_penalty=1.2,
+        )
+
+        # Clean up the result — take only the first line/sentence
+        if result:
+            # Remove any continuation patterns
+            for stop in ["\n\n", "\nSPEAKER_", "\nපෙර", "\nඊළඟ", "\nසටහන", "\nASR"]:
+                if stop in result:
+                    result = result.split(stop)[0].strip()
+            # Take first meaningful content (avoid empty results)
+            result = result.strip()
+
+        # Use corrected text if valid, otherwise fall back to aligned/raw
+        if result and len(result) >= 3:
+            corrected_text = result
+        else:
+            corrected_text = best_input
+
+        corrected.append({
+            "speaker": seg["speaker"],
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": corrected_text,
+        })
+
+        logger.info(
+            f"   LLM correction [{i+1}/{len(segments)}] {seg['speaker']} "
+            f"({seg['start']:.1f}-{seg['end']:.1f}s): "
+            f"'{best_input[:40]}...' → '{corrected_text[:40]}...'"
+        )
+
+    return corrected
 
 
 def _truncate_to_sentences(text: str, max_sentences: int = 1) -> str:
@@ -1103,12 +1410,15 @@ async def child_session(
     dependencies=[Depends(verify_api_key)],
     summary="Speaker Diarization + Sinhala ASR",
     description="""
-Upload an audio file to get a speaker-labeled Sinhala transcript.
+Upload an audio file to get a speaker-labeled Sinhala transcript with AI-optimized correction.
 
 The server will:
 1. Run **pyannote speaker diarization** to identify who spoke when
-2. Transcribe each speaker segment using **Whisper Sinhala ASR**
-3. Return speaker-labeled transcript segments
+2. Run **full-audio Whisper ASR** (with timestamps) for high-quality transcription
+3. **Align** Whisper chunks to speaker segments by timestamp overlap
+4. Run **per-segment ASR** as a secondary reference
+5. **Detect overlapping** speaker regions
+6. Use the **SinLlama LLM** to correct ASR errors and produce an optimized transcript
 
 Typically handles **4-5 speakers** in a single recording.
 Supports wav, mp3, flac, ogg, and webm formats.
@@ -1118,6 +1428,7 @@ Supports wav, mp3, flac, ogg, and webm formats.
 - `num_speakers` (optional): Exact number of speakers if known (skips auto-detection)
 - `min_speakers` (default 2): Minimum speakers for auto-detection
 - `max_speakers` (default 8): Maximum speakers for auto-detection
+- `enable_llm_optimization` (default true): Enable LLM-based transcript correction
 """,
 )
 async def diarize_audio(
@@ -1128,6 +1439,7 @@ async def diarize_audio(
     ),
     min_speakers: int = Form(default=2, description="Minimum expected speakers for auto-detection"),
     max_speakers: int = Form(default=8, description="Maximum expected speakers for auto-detection"),
+    enable_llm_optimization: bool = Form(default=True, description="Enable LLM-based transcript correction"),
 ):
     """Speaker diarization with per-speaker Sinhala transcription."""
     if diar_pipeline is None:
@@ -1243,11 +1555,33 @@ async def diarize_audio(
             f"{len(raw_segments)} segments in {diar_time_ms:.0f}ms"
         )
 
-        # ── Step 2: Per-Segment Sinhala ASR ──
+        # ── Step 2: Full-Audio Whisper ASR (with timestamps) ──
+        # Full-audio transcription is higher quality than per-segment because
+        # Whisper has the full conversational context
         asr_start = time.time()
-        result_segments: list[DiarizeSegment] = []
+        logger.info("   Running full-audio Whisper ASR with timestamps...")
 
-        for seg in raw_segments:
+        audio_array_full = waveform.squeeze().numpy().astype(np.float32)
+        full_asr_result = asr_pipe(
+            {"raw": audio_array_full, "sampling_rate": 16000},
+            return_timestamps=True,
+        )
+        full_audio_text = full_asr_result.get("text", "").strip()
+        whisper_chunks = full_asr_result.get("chunks", [])
+        logger.info(
+            f"   Full-audio ASR: '{full_audio_text[:60]}...' "
+            f"({len(whisper_chunks)} chunks)"
+        )
+
+        # ── Step 3: Align Whisper chunks to speaker segments ──
+        aligned_segments = _align_chunks_to_speakers(whisper_chunks, raw_segments)
+        logger.info(f"   Aligned {len(whisper_chunks)} Whisper chunks to {len(raw_segments)} speaker segments")
+
+        # ── Step 4: Per-Segment ASR (secondary reference) ──
+        logger.info("   Running per-segment ASR for secondary reference...")
+        segments_for_llm: list[dict] = []
+
+        for idx, seg in enumerate(raw_segments):
             try:
                 # Extract audio slice for this speaker turn
                 start_frame = int(seg["start"] * 16000)
@@ -1266,51 +1600,129 @@ async def diarize_audio(
                 )
                 text = asr_result["text"].strip()
 
-                if text:
-                    result_segments.append(
-                        DiarizeSegment(
-                            speaker=seg["speaker"],
-                            start=seg["start"],
-                            end=seg["end"],
-                            duration=round(seg["end"] - seg["start"], 3),
-                            text=text,
-                        )
-                    )
+                # Prepare for LLM correction: combine aligned + per-segment text
+                aligned_text = aligned_segments[idx]["text"] if idx < len(aligned_segments) else ""
+                segments_for_llm.append({
+                    "speaker": seg["speaker"],
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": text if text else "",
+                    "aligned_text": aligned_text,
+                })
 
             except Exception as e:
                 logger.warning(
                     f"   ASR failed for segment "
                     f"{seg['start']:.1f}-{seg['end']:.1f}s: {e}"
                 )
+                # Still add aligned text if available
+                aligned_text = aligned_segments[idx]["text"] if idx < len(aligned_segments) else ""
+                if aligned_text:
+                    segments_for_llm.append({
+                        "speaker": seg["speaker"],
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "text": "",
+                        "aligned_text": aligned_text,
+                    })
                 continue
 
         asr_time_ms = (time.time() - asr_start) * 1000
+        logger.info(
+            f"   ASR complete: {len(per_seg_results)} segments in {asr_time_ms:.0f}ms"
+        )
+
+        # ── Step 5: Detect Overlapping Speaker Regions ──
+        overlapping_regions = _detect_overlapping_regions(raw_segments)
+        if overlapping_regions:
+            logger.info(
+                f"   Detected {len(overlapping_regions)} overlapping region(s): "
+                + ", ".join(f"{o.start:.1f}-{o.end:.1f}s" for o in overlapping_regions)
+            )
+
+        # ── Step 6: LLM-Based Transcript Correction ──
+        llm_start = time.time()
+        final_segments: list[DiarizeSegment] = []
+
+        if enable_llm_optimization and segments_for_llm:
+            logger.info(
+                f"🤖 Running LLM transcript correction on {len(segments_for_llm)} segments..."
+            )
+            corrected = _llm_correct_transcript(
+                segments_for_llm,
+                full_audio_text,
+                overlapping_regions,
+            )
+
+            for i, seg_data in enumerate(corrected):
+                raw_asr = segments_for_llm[i]["text"] if i < len(segments_for_llm) else ""
+                ai_text = seg_data["text"]
+                if raw_asr or ai_text:
+                    final_segments.append(
+                        DiarizeSegment(
+                            speaker=seg_data["speaker"],
+                            start=seg_data["start"],
+                            end=seg_data["end"],
+                            duration=round(seg_data["end"] - seg_data["start"], 3),
+                            asr_text=raw_asr if raw_asr else "(empty)",
+                            ai_corrected_text=ai_text if ai_text else raw_asr,
+                            text=ai_text if ai_text else raw_asr,
+                        )
+                    )
+        else:
+            # No LLM optimization — asr_text and ai_corrected_text are the same
+            for seg_data in segments_for_llm:
+                raw_asr = seg_data.get("text", "")
+                aligned = seg_data.get("aligned_text", "")
+                best = aligned or raw_asr
+                if best:
+                    final_segments.append(
+                        DiarizeSegment(
+                            speaker=seg_data["speaker"],
+                            start=seg_data["start"],
+                            end=seg_data["end"],
+                            duration=round(seg_data["end"] - seg_data["start"], 3),
+                            asr_text=raw_asr if raw_asr else "(empty)",
+                            ai_corrected_text=best,
+                            text=best,
+                        )
+                    )
+
+        llm_time_ms = (time.time() - llm_start) * 1000
         total_ms = (time.time() - total_start) * 1000
 
-        # Build human-readable transcript text
-        transcript_lines = []
-        for seg in result_segments:
+        # Build human-readable transcript texts
+        ai_transcript_lines = []
+        raw_transcript_lines = []
+        for seg in final_segments:
             ts = f"[{seg.start:.1f}s - {seg.end:.1f}s]"
-            transcript_lines.append(f"{ts} {seg.speaker}: {seg.text}")
-        transcript_text = "\n".join(transcript_lines)
+            ai_transcript_lines.append(f"{ts} {seg.speaker}: {seg.ai_corrected_text}")
+            raw_transcript_lines.append(f"{ts} {seg.speaker}: {seg.asr_text}")
+        transcript_text = "\n".join(ai_transcript_lines)
+        raw_transcript_text = "\n".join(raw_transcript_lines)
 
-        all_speakers = sorted(set(s.speaker for s in result_segments))
+        all_speakers = sorted(set(s.speaker for s in final_segments))
 
         logger.info(
             f"🗣️ Diarization complete: {len(all_speakers)} speakers, "
-            f"{len(result_segments)} segments "
-            f"| diar={diar_time_ms:.0f}ms asr={asr_time_ms:.0f}ms total={total_ms:.0f}ms"
+            f"{len(final_segments)} segments "
+            f"| diar={diar_time_ms:.0f}ms asr={asr_time_ms:.0f}ms "
+            f"llm={llm_time_ms:.0f}ms total={total_ms:.0f}ms"
         )
 
         return DiarizeResponse(
             num_speakers=len(all_speakers),
             speakers=all_speakers,
-            total_segments=len(result_segments),
-            segments=result_segments,
+            total_segments=len(final_segments),
+            segments=final_segments,
+            full_audio_transcript=full_audio_text,
+            overlapping_regions=overlapping_regions,
             transcript_text=transcript_text,
+            raw_transcript_text=raw_transcript_text,
             audio_duration_s=round(audio_duration, 2),
             diarization_time_ms=round(diar_time_ms, 1),
             transcription_time_ms=round(asr_time_ms, 1),
+            ai_optimization_time_ms=round(llm_time_ms, 1),
             total_time_ms=round(total_ms, 1),
         )
 
