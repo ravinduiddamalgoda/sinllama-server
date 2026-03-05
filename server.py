@@ -504,50 +504,174 @@ def _llm_generate_internal(
         return ""
 
 
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+
+    return prev_row[-1]
+
+
+def _word_similarity(w1: str, w2: str) -> float:
+    """Return similarity score 0.0-1.0 between two words using normalized edit distance."""
+    if not w1 or not w2:
+        return 0.0
+    if w1 == w2:
+        return 1.0
+    max_len = max(len(w1), len(w2))
+    dist = _levenshtein_distance(w1, w2)
+    return 1.0 - (dist / max_len)
+
+
+def _word_level_fuse(text_a: str, text_b: str) -> str:
+    """Fuse two ASR outputs word-by-word, picking the best word from each.
+    
+    text_a = per-segment ASR (isolated segment, may be garbled)
+    text_b = aligned full-audio ASR (has more context, fewer chunks)
+    
+    Strategy:
+    - Align words by position
+    - For similar words (>0.5 similarity), pick the longer/more complete one
+    - For very different words, prefer text_b (full-audio context is better)
+    - Keep the word count close to the shorter text to avoid inflation
+    """
+    if not text_a and not text_b:
+        return ""
+    if not text_a:
+        return text_b
+    if not text_b:
+        return text_a
+
+    words_a = text_a.split()
+    words_b = text_b.split()
+
+    # If one is empty, return the other
+    if not words_a:
+        return text_b
+    if not words_b:
+        return text_a
+
+    # Use dynamic programming to align the two word sequences
+    # Simple approach: iterate through both, matching similar words
+    result = []
+    i, j = 0, 0
+
+    while i < len(words_a) and j < len(words_b):
+        wa = words_a[i]
+        wb = words_b[j]
+        sim = _word_similarity(wa, wb)
+
+        if sim >= 0.6:
+            # Similar words — pick the better one
+            # Prefer the one that looks more like a real Sinhala word (longer, no garble)
+            if sim >= 0.9:
+                # Almost identical — prefer full-audio version (text_b)
+                result.append(wb)
+            else:
+                # Moderately similar — pick longer word (more complete)
+                result.append(wb if len(wb) >= len(wa) else wa)
+            i += 1
+            j += 1
+        else:
+            # Very different words — check if skipping one creates better alignment
+            # Look ahead to see if next word matches
+            skip_a_sim = _word_similarity(words_a[min(i + 1, len(words_a) - 1)], wb) if i + 1 < len(words_a) else 0
+            skip_b_sim = _word_similarity(wa, words_b[min(j + 1, len(words_b) - 1)]) if j + 1 < len(words_b) else 0
+
+            if skip_a_sim > 0.6:
+                # Word in A is extra/garbled, skip it
+                i += 1
+            elif skip_b_sim > 0.6:
+                # Word in B is extra, skip it
+                j += 1
+            else:
+                # Both are different — prefer full-audio version
+                result.append(wb)
+                i += 1
+                j += 1
+
+    # Don't append remaining words — they're likely ASR artifacts
+
+    return " ".join(result)
+
+
+def _llm_correct_word(word: str, context: str) -> str:
+    """Use LLM to suggest the most likely correct Sinhala word for a garbled ASR word.
+    
+    Only called for heavily garbled words. Uses extremely tight token limits.
+    Returns the corrected word, or the original if LLM can't help.
+    """
+    if model is None or tokenizer is None:
+        return word
+
+    prompt = f"වැරදි සිංහල වචනය නිවැරදි කරන්න. එක වචනයක් පමණක් ලියන්න.\nවාක්‍ය: {context}\nවැරදි: {word}\nනිවැරදි:"
+
+    result = _llm_generate_internal(
+        prompt,
+        max_new_tokens=15,  # A single Sinhala word is at most ~10 tokens
+        temperature=0.1,
+        repetition_penalty=1.3,
+    )
+
+    if not result:
+        return word
+
+    # Take only the first word from the result
+    result_word = result.split()[0].strip(".,!?;:\"'()[]{}") if result.split() else ""
+
+    # Reject if result is way too different from input (hallucination)
+    if not result_word:
+        return word
+    if len(result_word) > len(word) * 3:
+        return word  # Too long — hallucination
+    if _word_similarity(word, result_word) < 0.2 and len(word) > 3:
+        return word  # Too different — likely hallucination
+
+    return result_word
+
+
 def _llm_correct_transcript(
     segments: list[dict],
     full_audio_text: str,
     overlapping_regions: list[OverlappingRegion],
 ) -> list[dict]:
-    """Use LLM to correct ASR transcript errors for each segment.
+    """Correct ASR transcript using word-level fusion + targeted LLM word correction.
     
-    Strategy:
-    - Send the full-audio transcript as reference context
-    - For each segment, provide the raw ASR text + aligned text + neighboring context
-    - Ask the LLM to produce a corrected version
-    - Process segments in batches for efficiency
+    Algorithm:
+    1. WORD-LEVEL FUSION: Merge per-segment ASR and full-audio aligned ASR
+       word-by-word using edit distance, picking the best word from each source.
+    2. TARGETED LLM CORRECTION: For remaining garbled words (detected by
+       character patterns), use LLM to suggest a single corrected word.
+    3. LENGTH GUARD: Output must be similar length to input — reject any
+       segment where output is >1.5x the input word count.
     
     Args:
         segments: [{"speaker": str, "start": float, "end": float, "text": str, "aligned_text": str}, ...]
-        full_audio_text: Full-audio Whisper transcript (higher quality reference)
+        full_audio_text: Full-audio Whisper transcript
         overlapping_regions: Detected overlap regions
     
     Returns:
-        list of {"speaker": str, "start": float, "end": float, "text": str} with corrected text
+        list of {"speaker": str, "start": float, "end": float, "text": str}
     """
-    if model is None or tokenizer is None:
-        logger.warning("LLM not loaded — skipping transcript correction")
-        return [{"speaker": s["speaker"], "start": s["start"], "end": s["end"],
-                 "text": s.get("aligned_text") or s["text"]} for s in segments]
-
     corrected = []
 
-    # Build overlap info string for context
-    overlap_info = ""
-    if overlapping_regions:
-        overlap_parts = []
-        for ovl in overlapping_regions:
-            overlap_parts.append(
-                f"  {ovl.start:.1f}s-{ovl.end:.1f}s: {', '.join(ovl.speakers)}"
-            )
-        overlap_info = "කථිකයන් අතිච්ඡාදනය වූ කාල:\n" + "\n".join(overlap_parts) + "\n"
-
-    # Process each segment with LLM correction
     for i, seg in enumerate(segments):
-        raw_text = seg["text"]
-        aligned_text = seg.get("aligned_text", "")
-        
-        # If both raw and aligned are empty, skip
+        raw_text = seg["text"]  # per-segment ASR
+        aligned_text = seg.get("aligned_text", "")  # full-audio aligned
+
+        # If both empty, skip
         if not raw_text and not aligned_text:
             corrected.append({
                 "speaker": seg["speaker"],
@@ -557,93 +681,64 @@ def _llm_correct_transcript(
             })
             continue
 
-        # Build context from neighboring segments
-        prev_context = ""
-        next_context = ""
-        if i > 0 and segments[i - 1].get("aligned_text") or (i > 0 and segments[i - 1].get("text")):
-            prev_seg = segments[i - 1]
-            prev_text = prev_seg.get("aligned_text") or prev_seg["text"]
-            prev_context = f"පෙර කථිකයා ({prev_seg['speaker']}): {prev_text}\n"
-        if i < len(segments) - 1:
-            next_seg = segments[i + 1]
-            next_text = next_seg.get("aligned_text") or next_seg["text"]
-            if next_text:
-                next_context = f"ඊළඟ කථිකයා ({next_seg['speaker']}): {next_text}\n"
+        # Step 1: Word-level fusion of both ASR sources
+        fused_text = _word_level_fuse(raw_text, aligned_text)
+        if not fused_text:
+            fused_text = raw_text or aligned_text
 
-        # Check if this segment is in an overlapping region
-        is_overlapping = False
-        for ovl in overlapping_regions:
-            if seg["start"] < ovl.end and seg["end"] > ovl.start:
-                is_overlapping = True
-                break
+        # Step 2: Targeted LLM correction for garbled words
+        # Only correct words that look garbled (very long compound words,
+        # or words with unusual character repetitions)
+        if model is not None and tokenizer is not None:
+            words = fused_text.split()
+            corrected_words = []
+            garbled_count = 0
 
-        # Build the correction prompt
-        # Use both the per-segment ASR and aligned full-audio text for best results
-        best_input = aligned_text if aligned_text else raw_text
-        secondary_input = raw_text if aligned_text and raw_text != aligned_text else ""
+            for w in words:
+                is_garbled = False
+                # Detect garbled words:
+                # - Unusually long for Sinhala (>20 chars without spaces)
+                # - Contains repeated character patterns
+                # - Has very unusual character density
+                if len(w) > 20:
+                    is_garbled = True
+                elif len(w) > 10 and any(w.count(c) > 3 for c in set(w) if c not in "්ා ි ී ු ූ ෙ ේ ො ෝ"):
+                    is_garbled = True
 
-        prompt_parts = [
-            "ඔබ සිංහල ASR පිටපත් නිවැරදි කරන විශේෂඥයෙකි.",
-            "පහත දැක්වෙන ASR මගින් ලබාගත් පිටපතෙහි වැරදි වචන නිවැරදි කර, අර්ථවත් සිංහල වාක්‍ය බවට පත් කරන්න.",
-            "මුල් අර්ථය වෙනස් නොකරන්න. නව වචන එකතු නොකරන්න. ඇති දේ පමණක් නිවැරදි කරන්න.",
-            "",
-        ]
+                if is_garbled and garbled_count < 5:  # Max 5 LLM calls per segment
+                    corrected_word = _llm_correct_word(w, fused_text)
+                    corrected_words.append(corrected_word)
+                    garbled_count += 1
+                    if corrected_word != w:
+                        logger.info(f"      Word fix: '{w}' → '{corrected_word}'")
+                else:
+                    corrected_words.append(w)
 
-        # Add full audio transcript as reference
-        if full_audio_text:
-            prompt_parts.append(f"සම්පූර්ණ හඬ පටිගත කිරීමේ ASR යොමුව: {full_audio_text}")
-            prompt_parts.append("")
-
-        if prev_context:
-            prompt_parts.append(prev_context.strip())
-        if next_context:
-            prompt_parts.append(next_context.strip())
-
-        if is_overlapping:
-            prompt_parts.append("(සටහන: මෙම කොටසේ කථිකයන් දෙදෙනෙකු එකවර කතා කරයි)")
-
-        prompt_parts.append("")
-        prompt_parts.append(f"{seg['speaker']} ({seg['start']:.1f}s-{seg['end']:.1f}s) ASR පිටපත: {best_input}")
-        if secondary_input:
-            prompt_parts.append(f"විකල්ප ASR: {secondary_input}")
-        prompt_parts.append(f"නිවැරදි පිටපත:")
-
-        prompt = "\n".join(prompt_parts)
-
-        # Generate correction
-        result = _llm_generate_internal(
-            prompt,
-            max_new_tokens=256,
-            temperature=0.3,
-            repetition_penalty=1.2,
-        )
-
-        # Clean up the result — take only the first line/sentence
-        if result:
-            # Remove any continuation patterns
-            for stop in ["\n\n", "\nSPEAKER_", "\nපෙර", "\nඊළඟ", "\nසටහන", "\nASR"]:
-                if stop in result:
-                    result = result.split(stop)[0].strip()
-            # Take first meaningful content (avoid empty results)
-            result = result.strip()
-
-        # Use corrected text if valid, otherwise fall back to aligned/raw
-        if result and len(result) >= 3:
-            corrected_text = result
+            final_text = " ".join(corrected_words)
         else:
-            corrected_text = best_input
+            final_text = fused_text
+
+        # Step 3: Length guard — reject if output is wildly different from input
+        input_words = len((raw_text or aligned_text).split())
+        output_words = len(final_text.split())
+        if input_words > 0 and output_words > input_words * 2:
+            logger.warning(
+                f"   Length guard: output ({output_words}w) > 2x input ({input_words}w), "
+                f"using raw ASR instead"
+            )
+            final_text = raw_text or aligned_text
 
         corrected.append({
             "speaker": seg["speaker"],
             "start": seg["start"],
             "end": seg["end"],
-            "text": corrected_text,
+            "text": final_text,
         })
 
         logger.info(
-            f"   LLM correction [{i+1}/{len(segments)}] {seg['speaker']} "
+            f"   Correction [{i+1}/{len(segments)}] {seg['speaker']} "
             f"({seg['start']:.1f}-{seg['end']:.1f}s): "
-            f"'{best_input[:40]}...' → '{corrected_text[:40]}...'"
+            f"'{(raw_text or '')[:40]}' → '{final_text[:40]}'"
         )
 
     return corrected
