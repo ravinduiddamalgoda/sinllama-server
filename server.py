@@ -9,11 +9,13 @@ import torch
 import time
 import logging
 import os
-from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional
+import tempfile
+import shutil
 
 # === Configuration ===
 BASE_MODEL_PATH = "/workspace/models/llama-3-8b-base"
@@ -46,13 +48,14 @@ async def verify_api_key(key: Optional[str] = Security(api_key_header)):
 model = None
 tokenizer = None
 input_device = None  # device where input tensors should be placed
+asr_pipe = None  # Whisper ASR pipeline
 
 
 # === Model Loading ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, cleanup on shutdown."""
-    global model, tokenizer, input_device
+    global model, tokenizer, input_device, asr_pipe
 
     # Set memory config for better allocation across 2 GPUs
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -169,11 +172,28 @@ async def lifespan(app: FastAPI):
     )
     logger.info("=" * 60)
 
+    # --- Step 5: Load Whisper ASR Pipeline (Sinhala) ---
+    logger.info("🎙️ Loading Whisper Small Sinhala ASR pipeline...")
+    from transformers import pipeline as hf_pipeline
+    # Place Whisper on GPU 1 to avoid competing with LLM on GPU 0
+    asr_device = 1 if num_gpus > 1 else 0
+    asr_pipe = hf_pipeline(
+        "automatic-speech-recognition",
+        model="Lingalingeswaran/whisper-small-sinhala",
+        device=asr_device,
+        torch_dtype=torch.float16,
+    )
+    logger.info(f"   Whisper ASR loaded on GPU {asr_device}")
+    for i in range(num_gpus):
+        alloc = torch.cuda.memory_allocated(i) / 1e9
+        total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+        logger.info(f"   GPU {i}: {alloc:.2f} / {total_mem:.1f} GB used (after ASR)")
+
     yield  # Server runs here
 
     # Cleanup
     logger.info("🧹 Shutting down, releasing GPU memory...")
-    del model, tokenizer
+    del model, tokenizer, asr_pipe
     torch.cuda.empty_cache()
     logger.info("👋 Server stopped.")
 
@@ -245,6 +265,12 @@ class ChildChatRequest(BaseModel):
 
 class ChildChatResponse(BaseModel):
     response: str
+    inference_time_ms: float
+
+
+class TranscribeResponse(BaseModel):
+    text: str
+    language: str = "si"
     inference_time_ms: float
 
 
@@ -722,6 +748,68 @@ async def child_chat(req: ChildChatRequest):
         response=response_text,
         inference_time_ms=result.inference_time_ms,
     )
+
+
+# === ASR Endpoint ===
+@app.post(
+    "/transcribe",
+    response_model=TranscribeResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def transcribe_audio(audio: UploadFile = File(..., description="Audio file (wav, mp3, flac, ogg, webm)")):
+    """Transcribe Sinhala speech to text using Whisper Small Sinhala model."""
+    if asr_pipe is None:
+        raise HTTPException(status_code=503, detail="ASR model not loaded yet.")
+
+    # Validate file type
+    allowed_types = {
+        "audio/wav", "audio/x-wav", "audio/wave",
+        "audio/mpeg", "audio/mp3",
+        "audio/flac",
+        "audio/ogg",
+        "audio/webm",
+        "application/octet-stream",  # fallback for unknown mime
+    }
+    if audio.content_type and audio.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type: {audio.content_type}. Use wav, mp3, flac, ogg, or webm.",
+        )
+
+    # Save uploaded file to a temp file (Whisper pipeline needs a file path)
+    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(audio.file, tmp)
+
+        start = time.time()
+
+        # Run Whisper inference
+        result = asr_pipe(tmp_path)
+        transcribed_text = result["text"].strip()
+
+        elapsed_ms = (time.time() - start) * 1000
+
+        logger.info(
+            f"🎙️ ASR: '{transcribed_text[:50]}...' in {elapsed_ms:.0f}ms "
+            f"| file={audio.filename} size={audio.size or 'unknown'}"
+        )
+
+        return TranscribeResponse(
+            text=transcribed_text,
+            language="si",
+            inference_time_ms=round(elapsed_ms, 1),
+        )
+
+    except Exception as e:
+        logger.error(f"ASR error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    finally:
+        # Clean up temp file
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # === Main ===
