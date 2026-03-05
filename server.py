@@ -9,13 +9,14 @@ import torch
 import time
 import logging
 import os
-from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File, Form
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional
 import tempfile
 import shutil
+import json as _json
 
 # === Configuration ===
 BASE_MODEL_PATH = "/workspace/models/llama-3-8b-base"
@@ -272,6 +273,15 @@ class TranscribeResponse(BaseModel):
     text: str
     language: str = "si"
     inference_time_ms: float
+
+
+class ChildSessionResponse(BaseModel):
+    """Combined ASR + child-chat response returned by /child-session."""
+    transcribed_text: str = Field(description="What Whisper heard the child say")
+    teacher_response: str = Field(description="Teacher's conversational reply")
+    asr_time_ms: float = Field(description="Time taken for speech-to-text (ms)")
+    chat_time_ms: float = Field(description="Time taken for response generation (ms)")
+    total_time_ms: float = Field(description="Total end-to-end time (ms)")
 
 
 # === Helpers ===
@@ -810,6 +820,211 @@ async def transcribe_audio(audio: UploadFile = File(..., description="Audio file
         # Clean up temp file
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+# === Combined ASR + Child Chat Endpoint ===
+@app.post(
+    "/child-session",
+    response_model=ChildSessionResponse,
+    dependencies=[Depends(verify_api_key)],
+    summary="Combined ASR + Child Chat (single round-trip)",
+    description="""
+Send the child's audio recording along with session metadata.
+The server will:
+1. Transcribe the audio using Whisper Sinhala ASR
+2. Generate the teacher's response (template-based for pronunciation scenarios, LLM for free chat)
+3. Return both the transcription and teacher response in one call
+
+**All metadata fields are sent as form fields alongside the audio file.**
+
+### Pronunciation Result Values
+| Value | Meaning |
+|---|---|
+| `new_word` | Introducing a new word to the child |
+| `correct` | Child said the word correctly |
+| `close` | Child was close but not exact |
+| `retry` | Child's pronunciation needs more work |
+| `no_speech` | No speech detected from the child |
+| `skipped` | Word was skipped |
+| *(empty)* | Free conversation (uses LLM) |
+
+### Session Flow
+1. Send `pronunciation_result=new_word` with `current_word` to introduce first word
+2. Send audio + `pronunciation_result` based on how the child did
+3. When correct, include `next_word` to transition
+4. When all words done, set `is_session_complete=true`
+""",
+)
+async def child_session(
+    audio: UploadFile = File(..., description="Child's audio recording (wav, mp3, flac, ogg, webm)"),
+    child_name: str = Form(default="ළමයා", description="Child's name"),
+    current_word: str = Form(default="", description="Word currently being practiced"),
+    pronunciation_result: str = Form(
+        default="",
+        description="ASR result: 'correct', 'close', 'retry', 'no_speech', 'skipped', 'new_word', or empty for free chat",
+    ),
+    attempt_number: int = Form(default=1, description="Which attempt for current word (1-10)"),
+    session_words: str = Form(
+        default="[]",
+        description='JSON array of session words, e.g. ["බල්ලා","පූසා","අලියා"]',
+    ),
+    next_word: str = Form(default="", description="Next word to transition to (when correct/skipped)"),
+    words_completed: int = Form(default=0, description="Words completed so far"),
+    is_session_complete: bool = Form(default=False, description="True when all words are done"),
+    conversation_history: str = Form(
+        default="[]",
+        description='JSON array of previous turns, e.g. ["ගුරුවරිය: ...","දරුවා: ..."]',
+    ),
+    target_phoneme: str = Form(default="", description="Target phoneme for practice"),
+):
+    """Combined endpoint: transcribes child audio + generates teacher response in one call."""
+    if asr_pipe is None:
+        raise HTTPException(status_code=503, detail="ASR model not loaded yet.")
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="LLM not loaded yet.")
+
+    total_start = time.time()
+
+    # --- Parse JSON form fields ---
+    try:
+        parsed_session_words = _json.loads(session_words) if session_words else []
+    except (ValueError, TypeError):
+        parsed_session_words = []
+    try:
+        parsed_history = _json.loads(conversation_history) if conversation_history else []
+    except (ValueError, TypeError):
+        parsed_history = []
+
+    # --- Step 1: ASR — Transcribe audio ---
+    allowed_types = {
+        "audio/wav", "audio/x-wav", "audio/wave",
+        "audio/mpeg", "audio/mp3",
+        "audio/flac", "audio/ogg", "audio/webm",
+        "application/octet-stream",
+    }
+    if audio.content_type and audio.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type: {audio.content_type}. Use wav, mp3, flac, ogg, or webm.",
+        )
+
+    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    transcribed_text = ""
+    asr_time_ms = 0.0
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(audio.file, tmp)
+
+        asr_start = time.time()
+        asr_result = asr_pipe(tmp_path)
+        transcribed_text = asr_result["text"].strip()
+        asr_time_ms = (time.time() - asr_start) * 1000
+
+        logger.info(
+            f"🎙️ ASR: '{transcribed_text[:60]}' in {asr_time_ms:.0f}ms"
+        )
+    except Exception as e:
+        logger.error(f"ASR error in child-session: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # --- Step 2: Generate teacher response ---
+    # Build a ChildChatRequest-like object for _build_child_response
+    class _SessionReq:
+        pass
+
+    req = _SessionReq()
+    req.child_utterance = transcribed_text
+    req.conversation_history = parsed_history
+    req.child_name = child_name
+    req.target_phoneme = target_phoneme
+    req.current_word = current_word
+    req.pronunciation_result = pronunciation_result
+    req.attempt_number = attempt_number
+    req.session_words = parsed_session_words
+    req.next_word = next_word
+    req.words_completed = words_completed
+    req.is_session_complete = is_session_complete
+
+    chat_start = time.time()
+
+    # Try template first
+    template_response = _build_child_response(req)
+
+    if template_response is not None:
+        chat_time_ms = (time.time() - chat_start) * 1000
+        total_ms = (time.time() - total_start) * 1000
+        logger.info(
+            f"💬 Child-session (template): asr={asr_time_ms:.0f}ms chat={chat_time_ms:.0f}ms "
+            f"total={total_ms:.0f}ms | result={pronunciation_result} word={current_word}"
+        )
+        return ChildSessionResponse(
+            transcribed_text=transcribed_text,
+            teacher_response=template_response,
+            asr_time_ms=round(asr_time_ms, 1),
+            chat_time_ms=round(chat_time_ms, 1),
+            total_time_ms=round(total_ms, 1),
+        )
+
+    # Free conversation fallback → use LLM
+    history_text = ""
+    if parsed_history:
+        history_text = "\n".join(parsed_history[-4:])
+
+    word_context = ""
+    if current_word:
+        desc = _get_word_description(current_word)
+        if desc:
+            word_context = f"දැන් ඉගෙන ගන්න වචනය: '{current_word}'. {desc}"
+        else:
+            word_context = f"දැන් ඉගෙන ගන්න වචනය: '{current_word}'."
+
+    prompt = f"""ඔබ කුඩා දරුවන්ට සිංහල වචන උගන්වන මිත්‍රශීලී ගුරුවරියකි.
+{child_name}ට කතා කරන්න. කෙටි වාක්‍ය 2ක්. සරල සිංහල.
+{word_context}
+
+{history_text}
+දරුවා: {transcribed_text}
+ගුරුවරිය:"""
+
+    gen_req = GenerateRequest(
+        prompt=prompt,
+        max_new_tokens=40,
+        temperature=0.4,
+        top_p=0.85,
+        top_k=40,
+        repetition_penalty=1.3,
+    )
+
+    result = await generate_text(gen_req)
+
+    response_text = result.generated_text
+    for stop_token in ["දරුවා:", "\n\n", "ගුරුවරිය:", "\nදරුවා", "\nගුරුවරිය"]:
+        if stop_token in response_text:
+            response_text = response_text.split(stop_token)[0].strip()
+
+    response_text = _truncate_to_sentences(response_text, max_sentences=2)
+
+    chat_time_ms = (time.time() - chat_start) * 1000
+    total_ms = (time.time() - total_start) * 1000
+
+    logger.info(
+        f"💬 Child-session (LLM): asr={asr_time_ms:.0f}ms chat={chat_time_ms:.0f}ms "
+        f"total={total_ms:.0f}ms"
+    )
+
+    return ChildSessionResponse(
+        transcribed_text=transcribed_text,
+        teacher_response=response_text,
+        asr_time_ms=round(asr_time_ms, 1),
+        chat_time_ms=round(chat_time_ms, 1),
+        total_time_ms=round(total_ms, 1),
+    )
 
 
 # === Main ===
