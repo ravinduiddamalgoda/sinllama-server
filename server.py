@@ -1202,8 +1202,15 @@ async def diarize_audio(
             )
 
         # Collect speaker segments (skip very short bursts < 0.4s)
+        # pyannote.audio v4.x returns DiarizeOutput; v3.x returns Annotation directly
+        annotation = diarization_result
+        if hasattr(diarization_result, "to_annotation"):
+            annotation = diarization_result.to_annotation()
+        elif hasattr(diarization_result, "annotation"):
+            annotation = diarization_result.annotation
+
         raw_segments = []
-        for turn, _, speaker in diarization_result.itertracks(yield_label=True):
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
             duration = turn.end - turn.start
             if duration < 0.4:
                 continue
