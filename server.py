@@ -648,23 +648,81 @@ def _is_meaningful_word(word: str) -> bool:
     # Garbled words have high token/char ratio because the tokenizer
     # falls back to character-level or byte-level encoding.
     #
-    # Examples (approximate):
-    #   "කතාකරන්න" (real) → ~2-3 tokens
-    #   "ඩයලායිශේෂයේෂ" (garbled) → ~8-12 tokens
-    #   "සම්බන්ධව" (real) → ~2 tokens
+    # Thresholds are intentionally STRICT to catch more garbled words.
+    # Words that pass here might still be caught by probability scoring.
 
     if char_count <= 4:
-        return token_count <= 3
+        return token_count <= 2
     elif char_count <= 8:
-        return token_count <= 5
+        return token_count <= 4
     elif char_count <= 14:
-        return token_count <= 6
+        return token_count <= 5
     else:
         # For longer words, use ratio
-        # Normal Sinhala: ~0.3-0.5 tokens per char
-        # Garbled: >0.55 tokens per char
         ratio = token_count / char_count
-        return ratio < 0.55
+        return ratio < 0.45
+
+
+def _score_all_words(sentence: str) -> list[tuple[str, float]]:
+    """Score how likely each word is in context using a SINGLE forward pass.
+    
+    Uses the causal LM property: predictions at position i only depend on
+    tokens 0..i-1. A single forward pass gives per-position probability.
+    
+    Words the model didn't expect get low scores — these are likely garbled.
+    
+    Returns: [(word, min_token_probability), ...] for each word.
+    """
+    words = sentence.split()
+    if not words or model is None or tokenizer is None:
+        return [(w, 1.0) for w in words]
+
+    try:
+        # Tokenize word by word to track token boundaries per word
+        all_token_ids: list[int] = []
+        word_boundaries: list[tuple[int, int]] = []  # (start, end) in token list
+
+        for idx, word in enumerate(words):
+            prefix = " " if idx > 0 else ""
+            tokens = tokenizer.encode(prefix + word, add_special_tokens=False)
+            start = len(all_token_ids)
+            all_token_ids.extend(tokens)
+            word_boundaries.append((start, len(all_token_ids)))
+
+        if not all_token_ids:
+            return [(w, 1.0) for w in words]
+
+        # Single forward pass — no generation, just get logits
+        input_tensor = torch.tensor([all_token_ids], device=input_device)
+        with torch.no_grad():
+            outputs = model(input_ids=input_tensor)
+            logits = outputs.logits[0]  # [seq_len, vocab_size]
+
+        probs = torch.softmax(logits, dim=-1)
+
+        # Score each word by the MINIMUM token probability within it.
+        # If any token in the word was very unexpected, the word is suspicious.
+        results = []
+        for word, (start, end) in zip(words, word_boundaries):
+            token_probs = []
+            for pos in range(start, end):
+                if pos > 0 and pos < len(all_token_ids):
+                    actual_token = all_token_ids[pos]
+                    p = probs[pos - 1, actual_token].item()
+                    token_probs.append(p)
+
+            if token_probs:
+                word_score = min(token_probs)
+            else:
+                word_score = 1.0
+
+            results.append((word, word_score))
+
+        return results
+
+    except Exception as e:
+        logger.warning(f"Word probability scoring failed: {e}")
+        return [(w, 1.0) for w in words]
 
 
 def _predict_correct_word(
@@ -674,34 +732,33 @@ def _predict_correct_word(
 ) -> str:
     """Use SinLlama transformer to predict the correct word given context.
     
-    Strategy (transformer-based prediction algorithm):
+    Algorithm:
     1. Feed left context to the model as a prompt
-    2. Run beam search to generate top-5 candidate next-word continuations
-    3. Extract the first word from each candidate beam
+    2. Beam search top-8 candidate next-word continuations
+    3. Extract first word from each candidate beam
     4. Score each candidate by:
-       - Character-level similarity to the garbled ASR word (they should
-         sound similar since ASR heard approximately the right phonemes)
+       - Character-level similarity to the garbled ASR word (phonetic proxy)
        - Tokenizer efficiency (real words tokenize cleanly)
        - Length compatibility (shouldn't be wildly different length)
-    5. Return the highest-scoring candidate if it passes threshold
+       - Beam rank (higher model probability = higher rank bonus)
+    5. Return highest-scoring candidate if it passes threshold
     
-    This leverages:
-    - The model's knowledge of Sinhala word sequences (language model probability)
-    - The tokenizer's vocabulary as a dictionary of real words
-    - Edit distance as a phonetic similarity proxy
+    Uses the model's knowledge of Sinhala word sequences to predict
+    what word SHOULD come at this position, then picks the candidate
+    most similar to what ASR heard.
     
     Args:
         left_context: Words before the garbled word
         garbled_word: The word to correct
-        right_context: Words after (reserved for future bidirectional use)
+        right_context: Words after (for future bidirectional use)
     
     Returns:
-        The predicted correct word, or original garbled_word if no good prediction
+        The predicted correct word, or original garbled_word if no match
     """
     if model is None or tokenizer is None:
         return garbled_word
 
-    # Need at least some context for prediction
+    # Need at least some context for meaningful prediction
     prompt = left_context.rstrip()
     if not prompt or len(prompt.split()) < 1:
         return garbled_word
@@ -718,15 +775,15 @@ def _predict_correct_word(
         inputs = {k: v.to(input_device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[1]
 
-        # Beam search: generate top-5 candidate continuations
+        # Beam search: generate top-8 candidate continuations
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=8,    # Enough tokens for one Sinhala word
-                num_beams=5,
-                num_return_sequences=5,
+                max_new_tokens=6,     # Enough tokens for one Sinhala word
+                num_beams=8,
+                num_return_sequences=8,
                 early_stopping=True,
-                do_sample=False,      # Pure beam search (deterministic)
+                do_sample=False,       # Pure beam search (deterministic)
                 pad_token_id=tokenizer.eos_token_id,
             )
 
@@ -747,36 +804,40 @@ def _predict_correct_word(
         best_word = garbled_word
         best_score = 0.0
 
-        for cand in candidates:
+        for rank, cand in enumerate(candidates):
             # (a) Similarity to garbled word (phonetic proximity)
             sim = _word_similarity(cand, garbled_word)
 
             # (b) Bonus for being a meaningful word (clean tokenization)
-            meaningful_bonus = 1.25 if _is_meaningful_word(cand) else 0.8
+            meaningful_bonus = 1.3 if _is_meaningful_word(cand) else 0.75
 
             # (c) Length compatibility — similar length words are preferred
-            len_ratio = min(len(cand), len(garbled_word)) / max(len(cand), len(garbled_word))
-            len_bonus = 0.6 + 0.4 * len_ratio  # range 0.6 to 1.0
+            max_l = max(len(cand), len(garbled_word), 1)
+            len_ratio = min(len(cand), len(garbled_word)) / max_l
+            len_bonus = 0.5 + 0.5 * len_ratio  # 0.5 to 1.0
 
-            score = sim * meaningful_bonus * len_bonus
+            # (d) Beam rank bonus — earlier beams have higher model probability
+            rank_bonus = 1.0 + 0.1 * max(0, 5 - rank)  # 1.5 for rank 0, 1.0 for rank 5+
+
+            score = sim * meaningful_bonus * len_bonus * rank_bonus
 
             if score > best_score:
                 best_score = score
                 best_word = cand
 
-        # Accept prediction only if score is reasonable
-        # 0.25 threshold prevents completely unrelated predictions
-        if best_score >= 0.25:
+        # Accept prediction if score is reasonable
+        # Lowered threshold to be more willing to correct
+        if best_score >= 0.20:
             logger.info(
-                f"      Transformer predict: '{garbled_word}' → '{best_word}' "
-                f"(score={best_score:.3f}, candidates={candidates[:3]})"
+                f"      Predict: '{garbled_word}' → '{best_word}' "
+                f"(score={best_score:.3f}, top3={candidates[:3]})"
             )
             return best_word
 
         return garbled_word
 
     except Exception as e:
-        logger.warning(f"Transformer word prediction failed for '{garbled_word}': {e}")
+        logger.warning(f"Word prediction failed for '{garbled_word}': {e}")
         return garbled_word
 
 
@@ -785,19 +846,22 @@ def _llm_correct_transcript(
     full_audio_text: str,
     overlapping_regions: list[OverlappingRegion],
 ) -> list[dict]:
-    """Correct ASR transcript using word-level fusion + transformer-based prediction.
+    """Correct ASR transcript using word-level fusion + LM probability scoring
+    + transformer beam-search prediction.
     
     Pipeline:
     1. WORD-LEVEL FUSION: Merge per-segment ASR and full-audio aligned ASR
-       word-by-word using edit distance, picking the best candidate from each.
-    2. TOKENIZER VALIDATION: For each word in the fused text, use the SinLlama
-       tokenizer to check if it's a meaningful Sinhala word (real words tokenize
-       efficiently; garbled words fragment into many subword pieces).
-    3. TRANSFORMER PREDICTION: For words that fail validation, feed the left
-       context to the SinLlama model and use beam search to predict the most
-       likely correct word. Score candidates by similarity to the garbled word
-       + tokenizer efficiency.
+       word-by-word using edit distance.
+    2. LM PROBABILITY SCORING: Single forward pass through SinLlama to score
+       every word. Words with low probability are flagged as suspicious —
+       the model didn't expect them in this context.
+    3. TRANSFORMER PREDICTION: For each suspicious word, beam search top-8
+       candidate continuations, pick the one most similar to the garbled word.
     4. LENGTH GUARD: Reject output if word count explodes vs input.
+    
+    This pipeline uses the LLM as a language model — exactly how a transformer
+    predicts the next word. Garbled words have low probability because the model
+    has never seen them in its Sinhala training data.
     
     Args:
         segments: [{"speaker": str, "start": float, "end": float, "text": str, "aligned_text": str}, ...]
@@ -828,43 +892,65 @@ def _llm_correct_transcript(
         if not fused_text:
             fused_text = raw_text or aligned_text
 
-        # ── Step 2 & 3: Tokenizer validation + Transformer prediction ──
+        # ── Step 2: LM probability scoring (single forward pass) ──
         if model is not None and tokenizer is not None:
-            words = fused_text.split()
+            word_scores = _score_all_words(fused_text)
+
+            logger.info(
+                f"   Seg {i+1} word scores: "
+                + ", ".join(f"'{w}'={p:.4f}" for w, p in word_scores)
+            )
+
+            # ── Step 3: Predict corrections for low-scoring words ──
             corrected_words = []
             prediction_count = 0
-            MAX_PREDICTIONS_PER_SEGMENT = 8  # Cap transformer calls per segment
+            MAX_PREDICTIONS = 12  # Max beam searches per segment
 
-            for word_idx, w in enumerate(words):
-                # Check if this word is meaningful using tokenizer
-                if _is_meaningful_word(w):
-                    corrected_words.append(w)
+            for word_idx, (word, prob) in enumerate(word_scores):
+                # Skip very short words (particles, connectors) — they're
+                # unlikely to be garbled and hard to predict anyway
+                if len(word) <= 2:
+                    corrected_words.append(word)
+                    continue
+
+                # HIGH probability → model expected this word → likely correct
+                if prob > 0.05:
+                    corrected_words.append(word)
+                    continue
+
+                # MEDIUM probability + passes tokenizer validation → probably OK
+                if prob > 0.01 and _is_meaningful_word(word):
+                    corrected_words.append(word)
+                    continue
+
+                # LOW probability → model didn't expect this word → try to correct
+                if prediction_count < MAX_PREDICTIONS:
+                    # Build left context from already-corrected words
+                    left_ctx = " ".join(corrected_words[-8:])
+
+                    # Build right context from upcoming words
+                    right_ctx = " ".join(
+                        w for w, _ in word_scores[word_idx + 1:word_idx + 4]
+                    )
+
+                    predicted = _predict_correct_word(left_ctx, word, right_ctx)
+                    corrected_words.append(predicted)
+                    prediction_count += 1
+
+                    if predicted != word:
+                        logger.info(
+                            f"      [{seg['speaker']}] Word {word_idx}: "
+                            f"'{word}' (p={prob:.4f}) → '{predicted}'"
+                        )
                 else:
-                    # Word failed tokenizer validation — it's likely garbled
-                    if prediction_count < MAX_PREDICTIONS_PER_SEGMENT:
-                        # Build left context from already-corrected words
-                        left_ctx = " ".join(corrected_words[-6:])  # last 6 words as context
-
-                        # Build right context from remaining words
-                        right_ctx = " ".join(words[word_idx + 1:word_idx + 4])
-
-                        predicted = _predict_correct_word(left_ctx, w, right_ctx)
-                        corrected_words.append(predicted)
-                        prediction_count += 1
-
-                        if predicted != w:
-                            logger.info(
-                                f"      [{seg['speaker']}] Word {word_idx}: "
-                                f"'{w}' → '{predicted}' (tokenizer flagged as garbled)"
-                            )
-                    else:
-                        corrected_words.append(w)  # Budget exceeded, keep as-is
+                    corrected_words.append(word)  # Budget exceeded
 
             final_text = " ".join(corrected_words)
 
             if prediction_count > 0:
                 logger.info(
-                    f"   Segment {i+1}: {prediction_count} words corrected by transformer"
+                    f"   Segment {i+1}: {prediction_count} word(s) "
+                    f"corrected by transformer prediction"
                 )
         else:
             final_text = fused_text
