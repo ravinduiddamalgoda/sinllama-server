@@ -9,8 +9,10 @@ import torch
 import time
 import logging
 import os
-from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File, Form
+import io
+from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File, Form, Query
 from fastapi.security import APIKeyHeader
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -19,12 +21,17 @@ import shutil
 import json as _json
 import numpy as np
 import torchaudio
+import soundfile as sf
 
 # === Configuration ===
 BASE_MODEL_PATH = "/workspace/models/llama-3-8b-base"
 ADAPTER_PATH = "/workspace/models/sinllama-adapter"
 TOKENIZER_PATH = "/workspace/models/sinhala-tokenizer"
 VOCAB_SIZE = 139336
+
+# TTS Configuration
+TTS_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.pth")
+TTS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # === Logging ===
 logging.basicConfig(
@@ -53,6 +60,10 @@ tokenizer = None
 input_device = None  # device where input tensors should be placed
 asr_pipe = None  # Whisper ASR pipeline
 diar_pipeline = None  # pyannote speaker diarization pipeline
+tts_synthesizer = None  # VITS TTS synthesizer
+tts_is_multi_speaker = False
+tts_speaker_names: list[str] = []
+tts_sample_rate = 22050
 
 
 # === Model Loading ===
@@ -60,6 +71,7 @@ diar_pipeline = None  # pyannote speaker diarization pipeline
 async def lifespan(app: FastAPI):
     """Load model on startup, cleanup on shutdown."""
     global model, tokenizer, input_device, asr_pipe, diar_pipeline
+    global tts_synthesizer, tts_is_multi_speaker, tts_speaker_names, tts_sample_rate
 
     # Set memory config for better allocation across 2 GPUs
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -221,11 +233,68 @@ async def lifespan(app: FastAPI):
         logger.error("   Set HF_TOKEN env var with your HuggingFace token.")
         diar_pipeline = None
 
+    # --- Step 7: Load Sinhala VITS TTS Model ---
+    logger.info("🔊 Loading Sinhala VITS TTS model...")
+    try:
+        from TTS.utils.synthesizer import Synthesizer as TTSSynthesizer
+
+        if os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
+            logger.info(f"   Model: {TTS_MODEL_PATH}")
+            logger.info(f"   Config: {TTS_CONFIG_PATH}")
+
+            tts_synthesizer = TTSSynthesizer(
+                tts_checkpoint=TTS_MODEL_PATH,
+                tts_config_path=TTS_CONFIG_PATH,
+                use_cuda=torch.cuda.is_available(),
+            )
+
+            tts_sample_rate = tts_synthesizer.tts_config.audio.sample_rate
+
+            # Detect speakers
+            if (
+                hasattr(tts_synthesizer.tts_model, "num_speakers")
+                and tts_synthesizer.tts_model.num_speakers > 1
+            ):
+                tts_is_multi_speaker = True
+                if (
+                    hasattr(tts_synthesizer.tts_model, "speaker_manager")
+                    and tts_synthesizer.tts_model.speaker_manager
+                ):
+                    sm = tts_synthesizer.tts_model.speaker_manager
+                    if hasattr(sm, "name_to_id"):
+                        tts_speaker_names = list(sm.name_to_id.keys())
+                    elif hasattr(sm, "speaker_names"):
+                        tts_speaker_names = list(sm.speaker_names)
+                if not tts_speaker_names:
+                    tts_speaker_names = ["oshadi", "mettananda"]  # fallback
+            else:
+                tts_is_multi_speaker = False
+                tts_speaker_names = []
+
+            logger.info(
+                f"   TTS loaded | Multi-speaker: {tts_is_multi_speaker} "
+                f"| Speakers: {tts_speaker_names} | Sample rate: {tts_sample_rate}"
+            )
+            for i in range(num_gpus):
+                alloc = torch.cuda.memory_allocated(i) / 1e9
+                total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+                logger.info(f"   GPU {i}: {alloc:.2f} / {total_mem:.1f} GB used (after TTS)")
+        else:
+            logger.warning(
+                f"   ⚠️ TTS model files not found at {TTS_MODEL_PATH} and {TTS_CONFIG_PATH}. "
+                "TTS endpoints will be unavailable."
+            )
+            tts_synthesizer = None
+    except Exception as e:
+        logger.error(f"   ❌ Failed to load TTS model: {e}")
+        logger.error("   TTS endpoints (/synthesize, /tts/speakers) will be unavailable.")
+        tts_synthesizer = None
+
     yield  # Server runs here
 
     # Cleanup
     logger.info("🧹 Shutting down, releasing GPU memory...")
-    del model, tokenizer, asr_pipe, diar_pipeline
+    del model, tokenizer, asr_pipe, diar_pipeline, tts_synthesizer
     torch.cuda.empty_cache()
     logger.info("👋 Server stopped.")
 
@@ -240,6 +309,12 @@ app = FastAPI(
 
 
 # === Request/Response Schemas ===
+class SynthesizeRequest(BaseModel):
+    text: str = Field(..., description="Romanized Sinhala text to synthesize")
+    speaker: Optional[str] = Field(default=None, description="Speaker name (for multi-speaker models)")
+    speed: Optional[float] = Field(default=1.0, ge=0.5, le=2.0, description="Speech speed multiplier")
+
+
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="Input text prompt")
     max_new_tokens: int = Field(default=256, ge=1, le=1024)
@@ -315,6 +390,15 @@ class ChildSessionResponse(BaseModel):
     total_time_ms: float = Field(description="Total end-to-end time (ms)")
 
 
+class WordScore(BaseModel):
+    """Per-word LM probability score indicating how meaningful/expected a word is."""
+    word: str = Field(description="The word (after correction if corrected)")
+    original_word: str = Field(description="Original ASR word before correction (same as word if not corrected)")
+    probability: float = Field(description="LM probability score (0.0-1.0). Higher = more expected/meaningful")
+    is_meaningful: bool = Field(description="Whether the word passed tokenizer validation as a real Sinhala word")
+    was_corrected: bool = Field(description="Whether this word was corrected by the transformer")
+
+
 class DiarizeSegment(BaseModel):
     """A single speaker-labeled transcript segment with both raw and AI-corrected text."""
     speaker: str = Field(description="Speaker label (e.g. SPEAKER_00)")
@@ -324,6 +408,11 @@ class DiarizeSegment(BaseModel):
     asr_text: str = Field(description="Original Whisper ASR transcription (raw, uncorrected)")
     ai_corrected_text: str = Field(description="LLM-corrected transcription (AI-optimized)")
     text: str = Field(description="Best available text (ai_corrected_text if available, else asr_text)")
+    word_scores: list[WordScore] = Field(default=[], description="Per-word probability scores showing which words are meaningful/garbled")
+    segment_accuracy_pct: float = Field(default=0.0, description="Percentage of words in this segment that are meaningful (probability > 0.01)")
+    total_words: int = Field(default=0, description="Total number of words in this segment")
+    meaningful_words: int = Field(default=0, description="Number of words that passed as meaningful")
+    corrected_words: int = Field(default=0, description="Number of words corrected by transformer")
 
 
 class OverlappingRegion(BaseModel):
@@ -349,6 +438,10 @@ class DiarizeResponse(BaseModel):
     transcription_time_ms: float = Field(description="Time for full-audio + per-segment ASR (ms)")
     ai_optimization_time_ms: float = Field(description="Time for LLM-based transcript correction (ms)")
     total_time_ms: float = Field(description="Total end-to-end processing time (ms)")
+    overall_accuracy_pct: float = Field(default=0.0, description="Overall percentage of words across all segments that are meaningful")
+    total_words: int = Field(default=0, description="Total words across all segments")
+    total_meaningful_words: int = Field(default=0, description="Total meaningful words across all segments")
+    total_corrected_words: int = Field(default=0, description="Total words corrected by transformer across all segments")
 
 
 # === Helpers ===
@@ -884,6 +977,7 @@ def _llm_correct_transcript(
                 "start": seg["start"],
                 "end": seg["end"],
                 "text": "",
+                "word_details": [],
             })
             continue
 
@@ -893,6 +987,8 @@ def _llm_correct_transcript(
             fused_text = raw_text or aligned_text
 
         # ── Step 2: LM probability scoring (single forward pass) ──
+        word_details: list[dict] = []  # Track per-word info for response
+
         if model is not None and tokenizer is not None:
             word_scores = _score_all_words(fused_text)
 
@@ -907,24 +1003,22 @@ def _llm_correct_transcript(
             MAX_PREDICTIONS = 12  # Max beam searches per segment
 
             for word_idx, (word, prob) in enumerate(word_scores):
-                # Skip very short words (particles, connectors) — they're
-                # unlikely to be garbled and hard to predict anyway
+                meaningful = _is_meaningful_word(word)
+                was_corrected = False
+                original_word = word
+                final_word = word
+
+                # Skip very short words (particles, connectors)
                 if len(word) <= 2:
                     corrected_words.append(word)
-                    continue
-
                 # HIGH probability → model expected this word → likely correct
-                if prob > 0.05:
+                elif prob > 0.05:
                     corrected_words.append(word)
-                    continue
-
                 # MEDIUM probability + passes tokenizer validation → probably OK
-                if prob > 0.01 and _is_meaningful_word(word):
+                elif prob > 0.01 and meaningful:
                     corrected_words.append(word)
-                    continue
-
                 # LOW probability → model didn't expect this word → try to correct
-                if prediction_count < MAX_PREDICTIONS:
+                elif prediction_count < MAX_PREDICTIONS:
                     # Build left context from already-corrected words
                     left_ctx = " ".join(corrected_words[-8:])
 
@@ -936,14 +1030,24 @@ def _llm_correct_transcript(
                     predicted = _predict_correct_word(left_ctx, word, right_ctx)
                     corrected_words.append(predicted)
                     prediction_count += 1
+                    final_word = predicted
+                    was_corrected = (predicted != word)
 
-                    if predicted != word:
+                    if was_corrected:
                         logger.info(
                             f"      [{seg['speaker']}] Word {word_idx}: "
                             f"'{word}' (p={prob:.4f}) → '{predicted}'"
                         )
                 else:
                     corrected_words.append(word)  # Budget exceeded
+
+                word_details.append({
+                    "word": corrected_words[-1],
+                    "original_word": original_word,
+                    "probability": round(prob, 6),
+                    "is_meaningful": meaningful,
+                    "was_corrected": was_corrected,
+                })
 
             final_text = " ".join(corrected_words)
 
@@ -954,6 +1058,15 @@ def _llm_correct_transcript(
                 )
         else:
             final_text = fused_text
+            # No LLM — still produce word details with default scores
+            for w in fused_text.split():
+                word_details.append({
+                    "word": w,
+                    "original_word": w,
+                    "probability": 1.0,
+                    "is_meaningful": True,
+                    "was_corrected": False,
+                })
 
         # ── Step 4: Length guard ──
         input_words = len((raw_text or aligned_text).split())
@@ -970,6 +1083,7 @@ def _llm_correct_transcript(
             "start": seg["start"],
             "end": seg["end"],
             "text": final_text,
+            "word_details": word_details,
         })
 
         logger.info(
@@ -1271,10 +1385,93 @@ async def health_check():
         "status": "healthy" if model is not None else "loading",
         "model_loaded": model is not None,
         "diarization_loaded": diar_pipeline is not None,
+        "tts_loaded": tts_synthesizer is not None,
+        "tts_multi_speaker": tts_is_multi_speaker,
+        "tts_speakers": tts_speaker_names,
         "gpu_count": torch.cuda.device_count(),
         "input_device": str(input_device) if input_device else None,
         "gpus": gpu_info,
     }
+
+
+# === TTS Helper ===
+
+def _tts_synthesize(text: str, speaker: str = None) -> io.BytesIO:
+    """Run VITS TTS and return a BytesIO buffer containing WAV audio."""
+    global tts_synthesizer, tts_is_multi_speaker, tts_sample_rate
+
+    if tts_synthesizer is None:
+        raise HTTPException(status_code=503, detail="TTS model not loaded.")
+
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+    speaker_name = None
+    if tts_is_multi_speaker:
+        speaker_name = speaker or "oshadi"
+        if speaker_name not in tts_speaker_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown speaker '{speaker_name}'. Available: {tts_speaker_names}",
+            )
+
+    t0 = time.time()
+    wav = tts_synthesizer.tts(text=text, speaker_name=speaker_name)
+    elapsed = time.time() - t0
+    logger.info(f"🔊 TTS: {len(text)} chars in {elapsed:.2f}s | speaker={speaker_name}")
+
+    wav_array = np.array(wav, dtype=np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, wav_array, tts_sample_rate, format="WAV", subtype="PCM_16")
+    buf.seek(0)
+    return buf
+
+
+# === TTS Endpoints ===
+
+@app.get("/tts/speakers")
+def tts_get_speakers():
+    """List available TTS speakers."""
+    return {
+        "speakers": tts_speaker_names,
+        "default": "oshadi" if tts_speaker_names else None,
+        "multi_speaker": tts_is_multi_speaker,
+    }
+
+
+@app.post(
+    "/synthesize",
+    dependencies=[Depends(verify_api_key)],
+    summary="Text-to-Speech (POST)",
+    description="Synthesize Sinhala speech from romanized text. Returns WAV audio.",
+)
+async def synthesize_post(req: SynthesizeRequest):
+    """Synthesize speech from text (JSON body)."""
+    buf = _tts_synthesize(req.text, req.speaker)
+    return StreamingResponse(
+        buf,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=output.wav"},
+    )
+
+
+@app.get(
+    "/synthesize",
+    dependencies=[Depends(verify_api_key)],
+    summary="Text-to-Speech (GET)",
+    description="Synthesize Sinhala speech from romanized text via query params. Returns WAV audio.",
+)
+async def synthesize_get(
+    text: str = Query(..., description="Romanized Sinhala text to synthesize"),
+    speaker: Optional[str] = Query(None, description="Speaker name (for multi-speaker models)"),
+):
+    """Synthesize speech from text (query parameters)."""
+    buf = _tts_synthesize(text, speaker)
+    return StreamingResponse(
+        buf,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=output.wav"},
+    )
 
 
 @app.post(
@@ -1989,6 +2186,20 @@ async def diarize_audio(
             for i, seg_data in enumerate(corrected):
                 raw_asr = segments_for_llm[i]["text"] if i < len(segments_for_llm) else ""
                 ai_text = seg_data["text"]
+                wd = seg_data.get("word_details", [])
+                total_w = len(wd)
+                meaningful_w = sum(1 for d in wd if d["is_meaningful"] or d["probability"] > 0.01)
+                corrected_w = sum(1 for d in wd if d["was_corrected"])
+                accuracy = round((meaningful_w / total_w * 100) if total_w > 0 else 0.0, 1)
+                ws_list = [
+                    WordScore(
+                        word=d["word"],
+                        original_word=d["original_word"],
+                        probability=d["probability"],
+                        is_meaningful=d["is_meaningful"],
+                        was_corrected=d["was_corrected"],
+                    ) for d in wd
+                ]
                 if raw_asr or ai_text:
                     final_segments.append(
                         DiarizeSegment(
@@ -1999,6 +2210,11 @@ async def diarize_audio(
                             asr_text=raw_asr if raw_asr else "(empty)",
                             ai_corrected_text=ai_text if ai_text else raw_asr,
                             text=ai_text if ai_text else raw_asr,
+                            word_scores=ws_list,
+                            segment_accuracy_pct=accuracy,
+                            total_words=total_w,
+                            meaningful_words=meaningful_w,
+                            corrected_words=corrected_w,
                         )
                     )
         else:
@@ -2008,6 +2224,13 @@ async def diarize_audio(
                 aligned = seg_data.get("aligned_text", "")
                 best = aligned or raw_asr
                 if best:
+                    words_in_seg = best.split()
+                    default_ws = [
+                        WordScore(
+                            word=w, original_word=w,
+                            probability=1.0, is_meaningful=True, was_corrected=False,
+                        ) for w in words_in_seg
+                    ]
                     final_segments.append(
                         DiarizeSegment(
                             speaker=seg_data["speaker"],
@@ -2017,6 +2240,11 @@ async def diarize_audio(
                             asr_text=raw_asr if raw_asr else "(empty)",
                             ai_corrected_text=best,
                             text=best,
+                            word_scores=default_ws,
+                            segment_accuracy_pct=100.0,
+                            total_words=len(words_in_seg),
+                            meaningful_words=len(words_in_seg),
+                            corrected_words=0,
                         )
                     )
 
@@ -2034,6 +2262,14 @@ async def diarize_audio(
         raw_transcript_text = "\n".join(raw_transcript_lines)
 
         all_speakers = sorted(set(s.speaker for s in final_segments))
+
+        # Calculate overall accuracy stats
+        grand_total_words = sum(s.total_words for s in final_segments)
+        grand_meaningful = sum(s.meaningful_words for s in final_segments)
+        grand_corrected = sum(s.corrected_words for s in final_segments)
+        grand_accuracy = round(
+            (grand_meaningful / grand_total_words * 100) if grand_total_words > 0 else 0.0, 1
+        )
 
         logger.info(
             f"🗣️ Diarization complete: {len(all_speakers)} speakers, "
@@ -2056,6 +2292,10 @@ async def diarize_audio(
             transcription_time_ms=round(asr_time_ms, 1),
             ai_optimization_time_ms=round(llm_time_ms, 1),
             total_time_ms=round(total_ms, 1),
+            overall_accuracy_pct=grand_accuracy,
+            total_words=grand_total_words,
+            total_meaningful_words=grand_meaningful,
+            total_corrected_words=grand_corrected,
         )
 
     except torch.cuda.OutOfMemoryError:
