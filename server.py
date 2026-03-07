@@ -12,7 +12,7 @@ import os
 import io
 from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File, Form, Query
 from fastapi.security import APIKeyHeader
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -21,7 +21,7 @@ import shutil
 import json as _json
 import numpy as np
 import torchaudio
-import soundfile as sf
+import httpx
 
 # === Configuration ===
 BASE_MODEL_PATH = "/workspace/models/llama-3-8b-base"
@@ -29,9 +29,8 @@ ADAPTER_PATH = "/workspace/models/sinllama-adapter"
 TOKENIZER_PATH = "/workspace/models/sinhala-tokenizer"
 VOCAB_SIZE = 139336
 
-# TTS Configuration
-TTS_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.pth")
-TTS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# TTS Microservice URL (tts_server.py runs separately on port 8001)
+TTS_SERVICE_URL = os.environ.get("TTS_SERVICE_URL", "http://127.0.0.1:8001")
 
 # === Logging ===
 logging.basicConfig(
@@ -60,10 +59,6 @@ tokenizer = None
 input_device = None  # device where input tensors should be placed
 asr_pipe = None  # Whisper ASR pipeline
 diar_pipeline = None  # pyannote speaker diarization pipeline
-tts_synthesizer = None  # VITS TTS synthesizer
-tts_is_multi_speaker = False
-tts_speaker_names: list[str] = []
-tts_sample_rate = 22050
 
 
 # === Model Loading ===
@@ -71,7 +66,6 @@ tts_sample_rate = 22050
 async def lifespan(app: FastAPI):
     """Load model on startup, cleanup on shutdown."""
     global model, tokenizer, input_device, asr_pipe, diar_pipeline
-    global tts_synthesizer, tts_is_multi_speaker, tts_speaker_names, tts_sample_rate
 
     # Set memory config for better allocation across 2 GPUs
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -233,68 +227,13 @@ async def lifespan(app: FastAPI):
         logger.error("   Set HF_TOKEN env var with your HuggingFace token.")
         diar_pipeline = None
 
-    # --- Step 7: Load Sinhala VITS TTS Model ---
-    logger.info("🔊 Loading Sinhala VITS TTS model...")
-    try:
-        from TTS.utils.synthesizer import Synthesizer as TTSSynthesizer
-
-        if os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
-            logger.info(f"   Model: {TTS_MODEL_PATH}")
-            logger.info(f"   Config: {TTS_CONFIG_PATH}")
-
-            tts_synthesizer = TTSSynthesizer(
-                tts_checkpoint=TTS_MODEL_PATH,
-                tts_config_path=TTS_CONFIG_PATH,
-                use_cuda=torch.cuda.is_available(),
-            )
-
-            tts_sample_rate = tts_synthesizer.tts_config.audio.sample_rate
-
-            # Detect speakers
-            if (
-                hasattr(tts_synthesizer.tts_model, "num_speakers")
-                and tts_synthesizer.tts_model.num_speakers > 1
-            ):
-                tts_is_multi_speaker = True
-                if (
-                    hasattr(tts_synthesizer.tts_model, "speaker_manager")
-                    and tts_synthesizer.tts_model.speaker_manager
-                ):
-                    sm = tts_synthesizer.tts_model.speaker_manager
-                    if hasattr(sm, "name_to_id"):
-                        tts_speaker_names = list(sm.name_to_id.keys())
-                    elif hasattr(sm, "speaker_names"):
-                        tts_speaker_names = list(sm.speaker_names)
-                if not tts_speaker_names:
-                    tts_speaker_names = ["oshadi", "mettananda"]  # fallback
-            else:
-                tts_is_multi_speaker = False
-                tts_speaker_names = []
-
-            logger.info(
-                f"   TTS loaded | Multi-speaker: {tts_is_multi_speaker} "
-                f"| Speakers: {tts_speaker_names} | Sample rate: {tts_sample_rate}"
-            )
-            for i in range(num_gpus):
-                alloc = torch.cuda.memory_allocated(i) / 1e9
-                total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
-                logger.info(f"   GPU {i}: {alloc:.2f} / {total_mem:.1f} GB used (after TTS)")
-        else:
-            logger.warning(
-                f"   ⚠️ TTS model files not found at {TTS_MODEL_PATH} and {TTS_CONFIG_PATH}. "
-                "TTS endpoints will be unavailable."
-            )
-            tts_synthesizer = None
-    except Exception as e:
-        logger.error(f"   ❌ Failed to load TTS model: {e}")
-        logger.error("   TTS endpoints (/synthesize, /tts/speakers) will be unavailable.")
-        tts_synthesizer = None
+    logger.info(f"📡 TTS microservice expected at: {TTS_SERVICE_URL}")
 
     yield  # Server runs here
 
     # Cleanup
     logger.info("🧹 Shutting down, releasing GPU memory...")
-    del model, tokenizer, asr_pipe, diar_pipeline, tts_synthesizer
+    del model, tokenizer, asr_pipe, diar_pipeline
     torch.cuda.empty_cache()
     logger.info("👋 Server stopped.")
 
@@ -1385,93 +1324,91 @@ async def health_check():
         "status": "healthy" if model is not None else "loading",
         "model_loaded": model is not None,
         "diarization_loaded": diar_pipeline is not None,
-        "tts_loaded": tts_synthesizer is not None,
-        "tts_multi_speaker": tts_is_multi_speaker,
-        "tts_speakers": tts_speaker_names,
+        "tts_service_url": TTS_SERVICE_URL,
         "gpu_count": torch.cuda.device_count(),
         "input_device": str(input_device) if input_device else None,
         "gpus": gpu_info,
     }
 
 
-# === TTS Helper ===
-
-def _tts_synthesize(text: str, speaker: str = None) -> io.BytesIO:
-    """Run VITS TTS and return a BytesIO buffer containing WAV audio."""
-    global tts_synthesizer, tts_is_multi_speaker, tts_sample_rate
-
-    if tts_synthesizer is None:
-        raise HTTPException(status_code=503, detail="TTS model not loaded.")
-
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-
-    speaker_name = None
-    if tts_is_multi_speaker:
-        speaker_name = speaker or "oshadi"
-        if speaker_name not in tts_speaker_names:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown speaker '{speaker_name}'. Available: {tts_speaker_names}",
-            )
-
-    t0 = time.time()
-    wav = tts_synthesizer.tts(text=text, speaker_name=speaker_name)
-    elapsed = time.time() - t0
-    logger.info(f"🔊 TTS: {len(text)} chars in {elapsed:.2f}s | speaker={speaker_name}")
-
-    wav_array = np.array(wav, dtype=np.float32)
-    buf = io.BytesIO()
-    sf.write(buf, wav_array, tts_sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    return buf
-
-
-# === TTS Endpoints ===
+# === TTS Proxy Endpoints (forwards to tts_server.py on port 8001) ===
 
 @app.get("/tts/speakers")
-def tts_get_speakers():
-    """List available TTS speakers."""
-    return {
-        "speakers": tts_speaker_names,
-        "default": "oshadi" if tts_speaker_names else None,
-        "multi_speaker": tts_is_multi_speaker,
-    }
+async def tts_get_speakers():
+    """List available TTS speakers (proxied from TTS microservice)."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{TTS_SERVICE_URL}/speakers")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="TTS service is not running. Start tts_server.py on port 8001.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS service error: {str(e)}")
 
 
 @app.post(
     "/synthesize",
     dependencies=[Depends(verify_api_key)],
     summary="Text-to-Speech (POST)",
-    description="Synthesize Sinhala speech from romanized text. Returns WAV audio.",
+    description="Synthesize Sinhala speech from romanized text. Proxied to TTS microservice. Returns WAV audio.",
 )
 async def synthesize_post(req: SynthesizeRequest):
-    """Synthesize speech from text (JSON body)."""
-    buf = _tts_synthesize(req.text, req.speaker)
-    return StreamingResponse(
-        buf,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=output.wav"},
-    )
+    """Synthesize speech from text (JSON body). Proxied to TTS microservice."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{TTS_SERVICE_URL}/synthesize",
+                json={"text": req.text, "speaker": req.speaker, "speed": req.speed},
+                headers={"X-API-Key": API_KEY},
+            )
+            resp.raise_for_status()
+            return StreamingResponse(
+                io.BytesIO(resp.content),
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=output.wav"},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="TTS service is not running. Start tts_server.py on port 8001.")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS service error: {str(e)}")
 
 
 @app.get(
     "/synthesize",
     dependencies=[Depends(verify_api_key)],
     summary="Text-to-Speech (GET)",
-    description="Synthesize Sinhala speech from romanized text via query params. Returns WAV audio.",
+    description="Synthesize Sinhala speech from romanized text via query params. Proxied to TTS microservice. Returns WAV audio.",
 )
 async def synthesize_get(
     text: str = Query(..., description="Romanized Sinhala text to synthesize"),
     speaker: Optional[str] = Query(None, description="Speaker name (for multi-speaker models)"),
 ):
-    """Synthesize speech from text (query parameters)."""
-    buf = _tts_synthesize(text, speaker)
-    return StreamingResponse(
-        buf,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=output.wav"},
-    )
+    """Synthesize speech from text (query parameters). Proxied to TTS microservice."""
+    try:
+        params = {"text": text}
+        if speaker:
+            params["speaker"] = speaker
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(
+                f"{TTS_SERVICE_URL}/synthesize",
+                params=params,
+                headers={"X-API-Key": API_KEY},
+            )
+            resp.raise_for_status()
+            return StreamingResponse(
+                io.BytesIO(resp.content),
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=output.wav"},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="TTS service is not running. Start tts_server.py on port 8001.")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS service error: {str(e)}")
 
 
 @app.post(
