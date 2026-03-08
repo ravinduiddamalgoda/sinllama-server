@@ -525,7 +525,8 @@ def _gcloud_stt_bytes(
         language_code="si-LK",
         enable_word_time_offsets=True,
         enable_automatic_punctuation=True,
-        model="latest_long",
+        # "latest_long" / "latest_short" are not supported for si-LK;
+        # omitting model field uses the default model which supports Sinhala.
     )
     audio_obj = speech.RecognitionAudio(content=audio_bytes)
     response = client.recognize(config=config, audio=audio_obj)

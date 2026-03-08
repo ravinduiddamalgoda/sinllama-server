@@ -309,6 +309,7 @@ mkdir -p /workspace/sinllama-server
 # Set environment variables
 export SINLLAMA_API_KEY="your-secret-key-2024"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your-service-account-key.json"
 
 # Start server (foreground for testing)
 cd /workspace/sinllama-server
