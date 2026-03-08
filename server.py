@@ -708,7 +708,7 @@ def _score_all_words(sentence: str) -> list[tuple[str, float]]:
     words = sentence.split()
     if not words or model is None or tokenizer is None:
         return [(w, 1.0) for w in words]
-
+        scored_words: list[tuple[str, float]] = []
     try:
         # Tokenize word by word to track token boundaries per word
         all_token_ids: list[int] = []
