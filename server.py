@@ -32,6 +32,14 @@ VOCAB_SIZE = 139336
 # TTS Microservice URL (tts_server.py runs separately on port 8001)
 TTS_SERVICE_URL = os.environ.get("TTS_SERVICE_URL", "http://127.0.0.1:8001")
 
+# Google Cloud Speech-to-Text — used exclusively by /diarize
+# Set GOOGLE_APPLICATION_CREDENTIALS to the path of your service-account JSON key file.
+GOOGLE_STT_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+# Maximum inline audio bytes for a single synchronous recognize() call.
+# At 16 kHz 16-bit mono: ~32 000 bytes/sec → 9 MB ≈ 4.7 minutes.
+_GOOGLE_STT_MAX_INLINE_BYTES = 9 * 1024 * 1024
+_GOOGLE_STT_CHUNK_SECS = 55  # chunk length for long-audio splitting
+
 # === Logging ===
 logging.basicConfig(
     level=logging.INFO,
@@ -491,6 +499,137 @@ def _align_chunks_to_speakers(
         })
 
     return aligned
+
+
+# ── Google Cloud STT helpers ─────────────────────────────────────────────────
+
+def _gcloud_stt_bytes(
+    audio_bytes: bytes,
+    time_offset_sec: float = 0.0,
+) -> tuple[str, list[dict]]:
+    """
+    Transcribe a single WAV audio chunk (≤ ~55 s) using Google Cloud STT.
+
+    Returns:
+        (transcript_text, chunks)
+        where chunks = [{"text": word, "timestamp": (abs_start, abs_end)}, ...]
+        — the same format that _align_chunks_to_speakers expects.
+    """
+    from google.cloud import speech
+
+    client = speech.SpeechClient()
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        audio_channel_count=1,
+        language_code="si-LK",
+        enable_word_time_offsets=True,
+        enable_automatic_punctuation=True,
+        model="latest_long",
+    )
+    audio_obj = speech.RecognitionAudio(content=audio_bytes)
+    response = client.recognize(config=config, audio=audio_obj)
+
+    text_parts: list[str] = []
+    chunks: list[dict] = []
+    for result in response.results:
+        alt = result.alternatives[0]
+        text_parts.append(alt.transcript)
+        for word_info in alt.words:
+            start_s = word_info.start_time.total_seconds() + time_offset_sec
+            end_s = word_info.end_time.total_seconds() + time_offset_sec
+            chunks.append({"text": word_info.word, "timestamp": (start_s, end_s)})
+
+    return " ".join(text_parts).strip(), chunks
+
+
+def _gcloud_stt_full(wav_path: str) -> tuple[str, list[dict]]:
+    """
+    Transcribe a full WAV file of any length using Google Cloud STT.
+
+    For audio ≤ _GOOGLE_STT_MAX_INLINE_BYTES a single synchronous call is used.
+    Longer files are split into _GOOGLE_STT_CHUNK_SECS-second chunks, each
+    transcribed independently, and the results are merged with corrected timestamps.
+
+    Returns (full_transcript_text, word_chunks) in the same format as
+    _gcloud_stt_bytes.
+    """
+    import wave as _wave
+    import io as _io
+
+    with open(wav_path, "rb") as f:
+        wav_content = f.read()
+
+    if len(wav_content) <= _GOOGLE_STT_MAX_INLINE_BYTES:
+        return _gcloud_stt_bytes(wav_content, time_offset_sec=0.0)
+
+    # ── Split into fixed-length chunks and process sequentially ──────────────
+    BYTES_PER_SEC = 16000 * 2  # 16 kHz, 16-bit, mono
+    CHUNK_BYTES = _GOOGLE_STT_CHUNK_SECS * BYTES_PER_SEC
+
+    # Read raw PCM frames (skip 44-byte WAV header)
+    with _wave.open(_io.BytesIO(wav_content), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        raw_frames = wf.readframes(wf.getnframes())
+
+    all_text: list[str] = []
+    all_chunks: list[dict] = []
+    offset_bytes = 0
+
+    while offset_bytes < len(raw_frames):
+        chunk_frames = raw_frames[offset_bytes: offset_bytes + CHUNK_BYTES]
+        time_offset_sec = offset_bytes / BYTES_PER_SEC
+
+        # Re-wrap raw PCM in a proper WAV container
+        buf = _io.BytesIO()
+        with _wave.open(buf, "wb") as wf_out:
+            wf_out.setnchannels(n_channels)
+            wf_out.setsampwidth(sampwidth)
+            wf_out.setframerate(framerate)
+            wf_out.writeframes(chunk_frames)
+        chunk_wav = buf.getvalue()
+
+        try:
+            text, chunks = _gcloud_stt_bytes(chunk_wav, time_offset_sec=time_offset_sec)
+            if text:
+                all_text.append(text)
+            all_chunks.extend(chunks)
+        except Exception as e:
+            logger.warning(f"   Google STT chunk at {time_offset_sec:.1f}s failed: {e}")
+
+        offset_bytes += CHUNK_BYTES
+
+    return " ".join(all_text).strip(), all_chunks
+
+
+def _gcloud_stt_segment(audio_array: np.ndarray, sample_rate: int = 16000) -> str:
+    """
+    Transcribe a short speaker-turn segment (numpy float32 array) with Google STT.
+    Returns the transcript string (empty string on failure).
+    """
+    import io as _io
+    import wave as _wave
+
+    # Convert float32 [-1, 1] → int16 PCM bytes
+    audio_int16 = np.clip(audio_array, -1.0, 1.0)
+    audio_int16 = (audio_int16 * 32767).astype(np.int16)
+
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_int16.tobytes())
+    wav_bytes = buf.getvalue()
+
+    try:
+        text, _ = _gcloud_stt_bytes(wav_bytes, time_offset_sec=0.0)
+        return text
+    except Exception as e:
+        logger.warning(f"   Google STT segment failed: {e}")
+        return ""
 
 
 def _llm_generate_internal(
@@ -1917,8 +2056,6 @@ async def diarize_audio(
                 "You must also accept the model licenses on HuggingFace."
             ),
         )
-    if asr_pipe is None:
-        raise HTTPException(status_code=503, detail="ASR model not loaded yet.")
 
     # Validate file type
     allowed_types = {
@@ -2021,30 +2158,22 @@ async def diarize_audio(
             f"{len(raw_segments)} segments in {diar_time_ms:.0f}ms"
         )
 
-        # ── Step 2: Full-Audio Whisper ASR (with timestamps) ──
-        # Full-audio transcription is higher quality than per-segment because
-        # Whisper has the full conversational context
+        # ── Step 2: Full-Audio Google STT (with word-level timestamps) ──
         asr_start = time.time()
-        logger.info("   Running full-audio Whisper ASR with timestamps...")
+        logger.info("   Running full-audio Google Cloud STT (si-LK)...")
 
-        audio_array_full = waveform.squeeze().numpy().astype(np.float32)
-        full_asr_result = asr_pipe(
-            {"raw": audio_array_full, "sampling_rate": 16000},
-            return_timestamps=True,
-        )
-        full_audio_text = full_asr_result.get("text", "").strip()
-        whisper_chunks = full_asr_result.get("chunks", [])
+        full_audio_text, stt_chunks = _gcloud_stt_full(wav_path)
         logger.info(
-            f"   Full-audio ASR: '{full_audio_text[:60]}...' "
-            f"({len(whisper_chunks)} chunks)"
+            f"   Full-audio STT: '{full_audio_text[:60]}...' "
+            f"({len(stt_chunks)} word chunks)"
         )
 
-        # ── Step 3: Align Whisper chunks to speaker segments ──
-        aligned_segments = _align_chunks_to_speakers(whisper_chunks, raw_segments)
-        logger.info(f"   Aligned {len(whisper_chunks)} Whisper chunks to {len(raw_segments)} speaker segments")
+        # ── Step 3: Align STT word chunks to speaker segments ──
+        aligned_segments = _align_chunks_to_speakers(stt_chunks, raw_segments)
+        logger.info(f"   Aligned {len(stt_chunks)} STT chunks to {len(raw_segments)} speaker segments")
 
-        # ── Step 4: Per-Segment ASR (secondary reference) ──
-        logger.info("   Running per-segment ASR for secondary reference...")
+        # ── Step 4: Per-Segment Google STT (secondary reference) ──
+        logger.info("   Running per-segment Google Cloud STT for secondary reference...")
         segments_for_llm: list[dict] = []
 
         for idx, seg in enumerate(raw_segments):
@@ -2057,31 +2186,23 @@ async def diarize_audio(
                 if seg_waveform.shape[1] < 1600:  # < 0.1s — skip
                     continue
 
-                # Convert to numpy for ASR pipeline
                 audio_array = seg_waveform.squeeze().numpy().astype(np.float32)
+                text = _gcloud_stt_segment(audio_array, sample_rate=16000)
 
-                # Transcribe using existing Whisper Sinhala pipeline
-                asr_result = asr_pipe(
-                    {"raw": audio_array, "sampling_rate": 16000},
-                )
-                text = asr_result["text"].strip()
-
-                # Prepare for LLM correction: combine aligned + per-segment text
                 aligned_text = aligned_segments[idx]["text"] if idx < len(aligned_segments) else ""
                 segments_for_llm.append({
                     "speaker": seg["speaker"],
                     "start": seg["start"],
                     "end": seg["end"],
-                    "text": text if text else "",
+                    "text": text,
                     "aligned_text": aligned_text,
                 })
 
             except Exception as e:
                 logger.warning(
-                    f"   ASR failed for segment "
+                    f"   STT failed for segment "
                     f"{seg['start']:.1f}-{seg['end']:.1f}s: {e}"
                 )
-                # Still add aligned text if available
                 aligned_text = aligned_segments[idx]["text"] if idx < len(aligned_segments) else ""
                 if aligned_text:
                     segments_for_llm.append({
