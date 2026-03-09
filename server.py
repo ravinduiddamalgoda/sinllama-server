@@ -1505,7 +1505,7 @@ async def synthesize_post(req: SynthesizeRequest):
         text_to_send = req.text
         if is_sinhala_unicode(req.text):
             # Transliterate Sinhala Unicode to ISO 15919 (romanized)
-            text_to_send = transliterate(req.text, SCHEMES['sinhalese'], SCHEMES['iso15919'])
+            text_to_send = transliterate(req.text, SCHEMES['sinhala'], SCHEMES['iso15919'])
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
