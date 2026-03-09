@@ -1496,16 +1496,19 @@ async def tts_get_speakers():
 async def synthesize_post(req: SynthesizeRequest):
     """Synthesize speech from text (JSON body). Proxied to TTS microservice."""
     try:
-        from indic_transliteration.sanscript import transliterate, SCHEMES
+        from indic_transliteration import sanscript
         import re
-        def is_sinhala_unicode(text):
-            # Sinhala Unicode range: \u0D80–\u0DFF
+
+        def is_sinhala_unicode(text: str) -> bool:
             return bool(re.search(r'[\u0D80-\u0DFF]', text))
 
         text_to_send = req.text
         if is_sinhala_unicode(req.text):
-            # Transliterate Sinhala Unicode to ISO 15919 (romanized)
-            text_to_send = transliterate(req.text, SCHEMES['sinhala'], SCHEMES['iso15919'])
+            # Convert Sinhala Unicode → IAST romanization (ISO 15919-compatible)
+            # so the VITS TTS model (trained on romanized input) can process it.
+            text_to_send = sanscript.transliterate(
+                req.text, sanscript.SINHALA, sanscript.IAST
+            )
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
@@ -1534,11 +1537,17 @@ async def synthesize_post(req: SynthesizeRequest):
     description="Synthesize Sinhala speech from romanized text via query params. Proxied to TTS microservice. Returns WAV audio.",
 )
 async def synthesize_get(
-    text: str = Query(..., description="Romanized Sinhala text to synthesize"),
+    text: str = Query(..., description="Sinhala text (Unicode or romanized IAST)"),
     speaker: Optional[str] = Query(None, description="Speaker name (for multi-speaker models)"),
 ):
     """Synthesize speech from text (query parameters). Proxied to TTS microservice."""
     try:
+        from indic_transliteration import sanscript
+        import re
+
+        if bool(re.search(r'[\u0D80-\u0DFF]', text)):
+            text = sanscript.transliterate(text, sanscript.SINHALA, sanscript.IAST)
+
         params = {"text": text}
         if speaker:
             params["speaker"] = speaker
