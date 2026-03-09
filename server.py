@@ -1496,10 +1496,21 @@ async def tts_get_speakers():
 async def synthesize_post(req: SynthesizeRequest):
     """Synthesize speech from text (JSON body). Proxied to TTS microservice."""
     try:
+        from indic_transliteration.sanscript import transliterate, SCHEMES
+        import re
+        def is_sinhala_unicode(text):
+            # Sinhala Unicode range: \u0D80–\u0DFF
+            return bool(re.search(r'[\u0D80-\u0DFF]', text))
+
+        text_to_send = req.text
+        if is_sinhala_unicode(req.text):
+            # Transliterate Sinhala Unicode to ISO 15919 (romanized)
+            text_to_send = transliterate(req.text, SCHEMES['sinhalese'], SCHEMES['iso15919'])
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{TTS_SERVICE_URL}/synthesize",
-                json={"text": req.text, "speaker": req.speaker, "speed": req.speed},
+                json={"text": text_to_send, "speaker": req.speaker, "speed": req.speed},
                 headers={"X-API-Key": API_KEY},
             )
             resp.raise_for_status()
