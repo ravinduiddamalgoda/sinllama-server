@@ -1487,6 +1487,88 @@ async def tts_get_speakers():
         raise HTTPException(status_code=502, detail=f"TTS service error: {str(e)}")
 
 
+# ── Sinhala Unicode → ISO 15919 romanization ─────────────────────────────────
+# Used to convert LLM output (Sinhala Unicode) to the romanized format the
+# VITS TTS model was trained on.  No external library required.
+
+_SIN_CONSONANTS: dict[str, str] = {
+    "ක": "k",  "ඛ": "kh", "ග": "g",  "ඝ": "gh", "ඞ": "ṅ",  "ඟ": "ṅg",
+    "ච": "c",  "ඡ": "ch", "ජ": "j",  "ඣ": "jh", "ඤ": "ñ",  "ඥ": "ñj",
+    "ට": "ṭ",  "ඨ": "ṭh", "ඩ": "ḍ",  "ඪ": "ḍh", "ණ": "ṇ",  "ඬ": "ṇḍ",
+    "ත": "t",  "ථ": "th", "ද": "d",  "ධ": "dh", "න": "n",  "ඳ": "nd",
+    "ප": "p",  "ඵ": "ph", "බ": "b",  "භ": "bh", "ම": "m",  "ඹ": "mb",
+    "ය": "y",  "ර": "r",  "ල": "l",  "ව": "v",
+    "ශ": "ś",  "ෂ": "ṣ",  "ස": "s",  "හ": "h",
+    "ළ": "ḷ",  "ෆ": "f",
+}
+
+_SIN_VOWELS: dict[str, str] = {
+    "අ": "a",  "ආ": "ā",  "ඇ": "æ",  "ඈ": "ǣ",
+    "ඉ": "i",  "ඊ": "ī",  "උ": "u",  "ඌ": "ū",
+    "ඍ": "r̥",  "එ": "e",  "ඒ": "ē",  "ඓ": "ai",
+    "ඔ": "o",  "ඕ": "ō",  "ඖ": "au",
+}
+
+_SIN_VOWEL_SIGNS: dict[str, str] = {
+    "ා": "ā",  "ැ": "æ",  "ෑ": "ǣ",
+    "ි": "i",  "ී": "ī",  "ු": "u",  "ූ": "ū",
+    "ෘ": "r̥",  "ෙ": "e",  "ේ": "ē",  "ෛ": "ai",
+    "ො": "o",  "ෝ": "ō",  "ෞ": "au",
+}
+
+_SIN_HALANTA = "්"   # virama — suppresses inherent vowel
+_SIN_ANUSVARA = "ං"  # anusvara → ṁ
+_SIN_VISARGA  = "ඃ"  # visarga → ḥ
+
+
+def _sinhala_to_roman(text: str) -> str:
+    """Convert Sinhala Unicode text to ISO 15919 romanization for TTS input."""
+    out: list[str] = []
+    chars = list(text)
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        peek = chars[i + 1] if i + 1 < len(chars) else ""
+
+        if ch in _SIN_CONSONANTS:
+            base = _SIN_CONSONANTS[ch]
+            if peek == _SIN_HALANTA:
+                out.append(base)          # pure consonant, no inherent 'a'
+                i += 2
+            elif peek in _SIN_VOWEL_SIGNS:
+                out.append(base + _SIN_VOWEL_SIGNS[peek])
+                i += 2
+            else:
+                out.append(base + "a")    # inherent vowel
+                i += 1
+        elif ch in _SIN_VOWELS:
+            out.append(_SIN_VOWELS[ch])
+            i += 1
+        elif ch in _SIN_VOWEL_SIGNS:
+            out.append(_SIN_VOWEL_SIGNS[ch])   # orphan sign (rare)
+            i += 1
+        elif ch == _SIN_HALANTA:
+            i += 1                             # orphan halanta — skip
+        elif ch == _SIN_ANUSVARA:
+            out.append("ṁ")
+            i += 1
+        elif ch == _SIN_VISARGA:
+            out.append("ḥ")
+            i += 1
+        else:
+            out.append(ch)                     # spaces, punctuation, digits
+            i += 1
+    return "".join(out)
+
+
+def _maybe_romanize(text: str) -> str:
+    """Return romanized text if input contains Sinhala Unicode, else return as-is."""
+    import re
+    if re.search(r"[\u0D80-\u0DFF]", text):
+        return _sinhala_to_roman(text)
+    return text
+
+
 @app.post(
     "/synthesize",
     dependencies=[Depends(verify_api_key)],
@@ -1496,19 +1578,7 @@ async def tts_get_speakers():
 async def synthesize_post(req: SynthesizeRequest):
     """Synthesize speech from text (JSON body). Proxied to TTS microservice."""
     try:
-        from indic_transliteration import sanscript
-        import re
-
-        def is_sinhala_unicode(text: str) -> bool:
-            return bool(re.search(r'[\u0D80-\u0DFF]', text))
-
-        text_to_send = req.text
-        if is_sinhala_unicode(req.text):
-            # Convert Sinhala Unicode → IAST romanization (ISO 15919-compatible)
-            # so the VITS TTS model (trained on romanized input) can process it.
-            text_to_send = sanscript.transliterate(
-                req.text, sanscript.SINHALA, sanscript.IAST
-            )
+        text_to_send = _maybe_romanize(req.text)
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
@@ -1542,13 +1612,7 @@ async def synthesize_get(
 ):
     """Synthesize speech from text (query parameters). Proxied to TTS microservice."""
     try:
-        from indic_transliteration import sanscript
-        import re
-
-        if bool(re.search(r'[\u0D80-\u0DFF]', text)):
-            text = sanscript.transliterate(text, sanscript.SINHALA, sanscript.IAST)
-
-        params = {"text": text}
+        params = {"text": _maybe_romanize(text)}
         if speaker:
             params["speaker"] = speaker
         async with httpx.AsyncClient(timeout=60.0) as client:
