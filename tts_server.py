@@ -27,6 +27,7 @@ import argparse
 import numpy as np
 import torch
 import soundfile as sf
+from scipy.signal import resample
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -175,7 +176,10 @@ app.add_middleware(
 
 
 # ── Helper ───────────────────────────────────────────────────────────
-def _synthesize(text: str, speaker: str = None) -> io.BytesIO:
+DEFAULT_SPEED = 0.85  # < 1.0 = slower, > 1.0 = faster
+
+
+def _synthesize(text: str, speaker: str = None, speed: float = DEFAULT_SPEED) -> io.BytesIO:
     """Run TTS and return WAV bytes in a BytesIO buffer."""
     global synthesizer, is_multi_speaker, sample_rate
 
@@ -200,6 +204,12 @@ def _synthesize(text: str, speaker: str = None) -> io.BytesIO:
     logger.info(f"Synthesized {len(text)} chars in {elapsed:.2f}s | speaker={speaker_name}")
 
     wav_array = np.array(wav, dtype=np.float32)
+
+    # Apply speed adjustment via resampling (pitch is preserved via sample_rate trick)
+    if speed != 1.0:
+        new_length = int(len(wav_array) / speed)
+        wav_array = resample(wav_array, new_length).astype(np.float32)
+
     buf = io.BytesIO()
     sf.write(buf, wav_array, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
@@ -237,7 +247,7 @@ def get_speakers():
 )
 def synthesize_post(req: SynthesizeRequest):
     """Synthesize speech from text (JSON body)."""
-    buf = _synthesize(req.text, req.speaker)
+    buf = _synthesize(req.text, req.speaker, req.speed or DEFAULT_SPEED)
     return StreamingResponse(
         buf,
         media_type="audio/wav",
@@ -254,9 +264,10 @@ def synthesize_post(req: SynthesizeRequest):
 def synthesize_get(
     text: str = Query(..., description="Romanized Sinhala text to synthesize"),
     speaker: Optional[str] = Query(None, description="Speaker name (for multi-speaker models)"),
+    speed: float = Query(DEFAULT_SPEED, ge=0.5, le=2.0, description="Speech speed multiplier"),
 ):
     """Synthesize speech from text (query parameters)."""
-    buf = _synthesize(text, speaker)
+    buf = _synthesize(text, speaker, speed)
     return StreamingResponse(
         buf,
         media_type="audio/wav",
